@@ -18,8 +18,8 @@ def load_cifar10():
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    trainset = torchvision.datasets.CIFAR10(root='/home/xm/code/data', train=True, download=True, transform=transform)
-    testset = torchvision.datasets.CIFAR10(root='/home/xm/code/data', train=False, download=True, transform=transform)
+    trainset = torchvision.datasets.CIFAR10(root='/home/lw/Project/data', train=True, download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR10(root='/home/lw/Project/data', train=False, download=True, transform=transform)
     return trainset, testset
 
 def load_cifar100():
@@ -27,8 +27,8 @@ def load_cifar100():
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    trainset = torchvision.datasets.CIFAR100(root='/home/xm/code/data', train=True, download=True, transform=transform)
-    testset = torchvision.datasets.CIFAR100(root='/home/xm/code/data', train=False, download=True, transform=transform)
+    trainset = torchvision.datasets.CIFAR100(root='/home/lw/Project/data', train=True, download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR100(root='/home/lw/Project/data', train=False, download=True, transform=transform)
     return trainset, testset
 
 

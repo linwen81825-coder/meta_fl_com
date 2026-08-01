@@ -102,7 +102,7 @@ def test_model(model, test_loader, criterion):
             output = model(data)
             loss = criterion(output, target)
 
-            test_loss += loss.item()
+            test_loss += loss.item() * target.size(0)
 
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -124,7 +124,11 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
     loss = criterion(output, target)
 
     # 计算权重更新量
-    pseudo_grads = torch.autograd.grad(loss, model.params(), create_graph=True)
+    pseudo_grads = torch.autograd.grad(
+        loss,
+        model.params(),
+        create_graph=(aggregation == 'mlp')
+    )    
     return loss, pseudo_grads
 
 
@@ -310,6 +314,7 @@ prob_vector = (
 
 print("prob_vector: ", prob_vector)
 
+best_acc = 0.0
 
 for round in range(num_rounds):
 
@@ -346,11 +351,7 @@ for round in range(num_rounds):
         client_losses
     ).view(-1, 1).to(device)
 
-    print(
-        'Average_train_loss: ',
-        client_losses_tensor.mean()
-    )
-
+    avg_client_loss = client_losses_tensor.mean().item()        
 
     # ==================================================
     # 根据参数选择聚合权重
@@ -501,10 +502,15 @@ for round in range(num_rounds):
         criterion
     )
 
+    best_acc = max(best_acc, test_accuracy)
+
     print(
-        f"Round {round + 1}, "
-        f"Test Loss: {test_loss:.4f}, "
-        f"Test Accuracy: {test_accuracy:.2f}%"
+        f"Round {round + 1} | "
+        f"Client Loss: {avg_client_loss:.4f} | "
+        f"Test Loss: {test_loss:.4f} | "
+        f"Test Acc: {test_accuracy:.2f}% | "
+        f"Best Acc: {best_acc:.2f}%",
+        flush=True
     )
 
 
@@ -513,7 +519,7 @@ for round in range(num_rounds):
         torch.save(
             meta_net.state_dict(),
             (
-                f'/save/mlp_model_s_LN'
+                f'./save/mlp_model_s_LN'
                 f'{num_selected}_N{num_clients}_'
                 f'BS{batch_size}_{dataset}_'
                 f'{time_str}.pth'
@@ -524,7 +530,7 @@ for round in range(num_rounds):
     torch.save(
         global_model.state_dict(),
         (
-            f'/save/{aggregation}_'
+            f'./save/{aggregation}_'
             f'global_model_s_LN'
             f'{num_selected}_N{num_clients}_'
             f'BS{batch_size}_{dataset}_'
