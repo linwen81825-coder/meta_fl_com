@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from dataset.dataSplit_LN_new import get_data_loaders_new
 from model.model import MLP
-from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1
+from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18
 import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
@@ -12,7 +12,26 @@ import argparse
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def build_model(dataset, layers=10, widen_factor=1, droprate=0):
+def build_model(dataset, layers=10, widen_factor=2, droprate=0):
+# def build_model(dataset):
+#     if dataset == 'cifar10':
+#         model = ResNet18(num_classes=10)
+
+#     elif dataset == 'cifar100':
+#         model = ResNet18(num_classes=100)
+
+#     elif dataset == 'clothing1m':
+#         model = SmallMetaConvNet1(num_classes=14)
+
+#     else:
+#         raise ValueError(f"Unsupported dataset: {dataset}")
+
+#     if torch.cuda.is_available():
+#         model.cuda()
+#         torch.backends.cudnn.benchmark = True
+
+#     return model
+
     # model = ResNet32(args.dataset == 'cifar10' and 10 or 100)
     # model = WideResNet(
     #     layers,
@@ -20,10 +39,35 @@ def build_model(dataset, layers=10, widen_factor=1, droprate=0):
     #     widen_factor,
     #     dropRate=droprate
     # )
+
+    # if dataset == 'cifar10':
+    #     model = SmallMetaConvNet(num_classes=10)
+    # elif dataset == 'cifar100':
+    #     model = SmallMetaConvNet(num_classes=100)
+    # elif dataset == 'clothing1m':
+    #     model = SmallMetaConvNet1(num_classes=14)
+
+    # if torch.cuda.is_available():
+    #     model.cuda()
+    #     torch.backends.cudnn.benchmark = True
+
+    # return model
+
+
     if dataset == 'cifar10':
-        model = SmallMetaConvNet(num_classes=10)
+        model = WideResNet(
+            layers,
+            10,
+            widen_factor,
+            dropRate=droprate
+        )
     elif dataset == 'cifar100':
-        model = SmallMetaConvNet(num_classes=100)
+        model = WideResNet(
+            layers,
+            100,
+            widen_factor,
+            dropRate=droprate
+        )
     elif dataset == 'clothing1m':
         model = SmallMetaConvNet1(num_classes=14)
 
@@ -127,10 +171,16 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
     pseudo_grads = torch.autograd.grad(
         loss,
         model.params(),
-        create_graph=(aggregation == 'mlp')
-    )    
-    return loss, pseudo_grads
+        create_graph=False,
+        retain_graph=False
+    )
 
+    pseudo_grads = tuple(
+        grad.detach()
+        for grad in pseudo_grads
+    )
+
+    return loss.detach(), pseudo_grads
 
 parser = argparse.ArgumentParser(
     description='Your script description.'
@@ -267,23 +317,7 @@ optimizer_model = torch.optim.SGD(
 
 
 # 模拟多个客户端
-client_models = [
-    build_model(dataset).to(device)
-    for _ in range(num_clients)
-]
-
-
-client_optimizers = [
-    torch.optim.SGD(
-        model.params(),
-        lr,
-        momentum=momentum,
-        nesterov=nesterov,
-        weight_decay=weight_decay
-    )
-    for model in client_models
-]
-
+client_model = build_model(dataset).to(device)
 
 # 初始化元学习网络
 meta_net = MLP(
@@ -307,12 +341,12 @@ now = datetime.datetime.now()
 time_str = now.strftime('%m%d_%H%M')
 
 
-# 设置随机的通信成功率
-prob_vector = (
-    torch.rand(num_clients) * 0.7 + 0.3
-).view(-1, 1).to(device)
+# # 设置随机的通信成功率
+# prob_vector = (
+#     torch.rand(num_clients) * 0.7 + 0.3
+# ).view(-1, 1).to(device)
 
-print("prob_vector: ", prob_vector)
+# print("prob_vector: ", prob_vector)
 
 best_acc = 0.0
 
@@ -324,27 +358,37 @@ for round in range(num_rounds):
         global_model.state_dict()
     )
 
-    for model in client_models:
-        model.load_state_dict(
-            pseudo_net.state_dict()
-        )
-
     # 客户端训练并上传权重更新
     client_losses = []
     grads_list = []
 
     for i in range(num_clients):
+        client_model.load_state_dict(
+            pseudo_net.state_dict()
+        )
+
+        # 每个客户端使用新的独立优化器
+        client_optimizer = torch.optim.SGD(
+            client_model.params(),
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay
+        )
+
         loss, weight_updates = client_train_1(
-            client_models[i],
+            client_model,
             train_dataloaders[i],
             criterion,
-            client_optimizers[i],
+            client_optimizer,
             num_epochs,
             num_batches
         )
 
         grads_list.append(weight_updates)
-        client_losses.append(loss)
+        client_losses.append(loss.item())
+
+        del client_optimizer
 
 
     client_losses_tensor = torch.tensor(
@@ -382,15 +426,15 @@ for round in range(num_rounds):
             device=device
         )
 
-        print(
-            "FedAvg weight:",
-            pseudo_weight[0]
-        )
+        # print(
+        #     "FedAvg weight:",
+        #     pseudo_weight[0]
+        # )
 
-        print(
-            "weight_sum:",
-            pseudo_weight.sum()
-        )
+        # print(
+        #     "weight_sum:",
+        #     pseudo_weight.sum()
+        # )
 
 
     # 聚合客户端梯度
