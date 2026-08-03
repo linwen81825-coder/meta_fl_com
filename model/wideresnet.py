@@ -311,11 +311,12 @@ class MetaMLPExpert(MetaModule):
 
 class MetaMoEHead(MetaModule):
     """
-    稠密 MoE 分类头。
+    Top-1 稀疏 MoE。
 
-    每个样本都会经过全部专家，
-    gate 输出每个专家的混合权重。
+    Gate 为每个样本选择一个专家，
+    只执行被选中的专家。
     """
+
     def __init__(
         self,
         input_dim,
@@ -326,8 +327,8 @@ class MetaMoEHead(MetaModule):
         super(MetaMoEHead, self).__init__()
 
         self.num_experts = num_experts
+        self.num_classes = num_classes
 
-        # 多个 MLP 专家
         self.experts = nn.ModuleList([
             MetaMLPExpert(
                 input_dim=input_dim,
@@ -337,54 +338,96 @@ class MetaMoEHead(MetaModule):
             for _ in range(num_experts)
         ])
 
-        # gate：
-        # 输入特征 -> 每个专家的分数
         self.gate = MetaLinear(
             input_dim,
             num_experts
         )
 
-        # 仅用于日志观察
         self.last_gate_weights = None
+        self.last_selected_expert = None
 
     def forward(self, x):
+        batch_size = x.size(0)
 
-        # [batch_size, num_experts]
+        # [B, num_experts]
         gate_logits = self.gate(x)
 
-        gate_weights = torch.softmax(
+        gate_probs = torch.softmax(
             gate_logits,
             dim=1
         )
 
-        # 每个专家输出：
-        # [batch_size, num_classes]
-        expert_outputs = [
-            expert(x)
-            for expert in self.experts
-        ]
-
-        # [batch_size, num_experts, num_classes]
-        expert_outputs = torch.stack(
-            expert_outputs,
+        # 每个样本选择一个专家
+        selected_expert = torch.argmax(
+            gate_probs,
             dim=1
         )
 
-        # 保存 gate 权重供日志查看
+        hard_gate = F.one_hot(
+            selected_expert,
+            num_classes=self.num_experts
+        ).to(
+            dtype=x.dtype,
+            device=x.device
+        )
+
+        # 前向为硬选择，反向通过 softmax 概率训练 Gate
+        gate_weights = (
+            hard_gate
+            - gate_probs.detach()
+            + gate_probs
+        )
+
+        output = x.new_zeros(
+            batch_size,
+            self.num_classes
+        )
+
+        for expert_id, expert in enumerate(
+            self.experts
+        ):
+            sample_indices = torch.nonzero(
+                selected_expert == expert_id,
+                as_tuple=False
+            ).squeeze(1)
+
+            if sample_indices.numel() == 0:
+                continue
+
+            expert_inputs = x.index_select(
+                0,
+                sample_indices
+            )
+
+            expert_outputs = expert(
+                expert_inputs
+            )
+
+            selected_weights = gate_weights.index_select(
+                0,
+                sample_indices
+            )[:, expert_id].unsqueeze(1)
+
+            weighted_outputs = (
+                expert_outputs
+                * selected_weights
+            )
+
+            output = output.index_add(
+                0,
+                sample_indices,
+                weighted_outputs
+            )
+
         self.last_gate_weights = (
-            gate_weights.detach()
+            gate_probs.detach()
         )
 
-        # [batch_size, num_experts, 1]
-        gate_weights = gate_weights.unsqueeze(-1)
-
-        # 按 gate 权重混合全部专家输出
-        output = torch.sum(
-            expert_outputs * gate_weights,
-            dim=1
+        self.last_selected_expert = (
+            selected_expert.detach()
         )
-
         return output
+
 
 class SmallMetaConvNet(MetaModule):
     def __init__(self, num_classes=10,num_experts=4,expert_hidden_dim=128):

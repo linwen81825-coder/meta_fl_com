@@ -166,18 +166,24 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
 
     output = model(data)
     loss = criterion(output, target)
-
+    model_params = tuple(model.params())
     # 计算权重更新量
     pseudo_grads = torch.autograd.grad(
         loss,
-        model.params(),
+        model_params,
         create_graph=False,
-        retain_graph=False
+        retain_graph=False,
+        allow_unused=True
     )
 
     pseudo_grads = tuple(
-        grad.detach()
-        for grad in pseudo_grads
+        torch.zeros_like(param)
+        if grad is None
+        else grad.detach()
+        for param, grad in zip(
+            model_params,
+            pseudo_grads
+        )
     )
 
     return loss.detach(), pseudo_grads
