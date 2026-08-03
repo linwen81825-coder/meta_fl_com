@@ -12,8 +12,8 @@ import argparse
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def build_model(dataset, layers=10, widen_factor=2, droprate=0):
-# def build_model(dataset):
+# def build_model(dataset, layers=10, widen_factor=2, droprate=0):
+def build_model(dataset):
 #     if dataset == 'cifar10':
 #         model = ResNet18(num_classes=10)
 
@@ -40,34 +40,10 @@ def build_model(dataset, layers=10, widen_factor=2, droprate=0):
     #     dropRate=droprate
     # )
 
-    # if dataset == 'cifar10':
-    #     model = SmallMetaConvNet(num_classes=10)
-    # elif dataset == 'cifar100':
-    #     model = SmallMetaConvNet(num_classes=100)
-    # elif dataset == 'clothing1m':
-    #     model = SmallMetaConvNet1(num_classes=14)
-
-    # if torch.cuda.is_available():
-    #     model.cuda()
-    #     torch.backends.cudnn.benchmark = True
-
-    # return model
-
-
     if dataset == 'cifar10':
-        model = WideResNet(
-            layers,
-            10,
-            widen_factor,
-            dropRate=droprate
-        )
+        model = SmallMetaConvNet(num_classes=10)
     elif dataset == 'cifar100':
-        model = WideResNet(
-            layers,
-            100,
-            widen_factor,
-            dropRate=droprate
-        )
+        model = SmallMetaConvNet(num_classes=100)
     elif dataset == 'clothing1m':
         model = SmallMetaConvNet1(num_classes=14)
 
@@ -76,6 +52,30 @@ def build_model(dataset, layers=10, widen_factor=2, droprate=0):
         torch.backends.cudnn.benchmark = True
 
     return model
+
+
+    # if dataset == 'cifar10':
+    #     model = WideResNet(
+    #         layers,
+    #         10,
+    #         widen_factor,
+    #         dropRate=droprate
+    #     )
+    # elif dataset == 'cifar100':
+    #     model = WideResNet(
+    #         layers,
+    #         100,
+    #         widen_factor,
+    #         dropRate=droprate
+    #     )
+    # elif dataset == 'clothing1m':
+    #     model = SmallMetaConvNet1(num_classes=14)
+
+    # if torch.cuda.is_available():
+    #     model.cuda()
+    #     torch.backends.cudnn.benchmark = True
+
+    # return model
 
 
 def client_train(model, train_loader, criterion, optimizer, num_epochs, num_batches):
@@ -110,19 +110,44 @@ def client_train(model, train_loader, criterion, optimizer, num_epochs, num_batc
 
 
 # 定义服务器聚合函数
-def aggregate_weight_updates(updates_list):
-    # 初始化聚合后的权重更新
-    aggregated_updates = {name: torch.zeros_like(updates_list[0][name]) for name in updates_list[0].keys()}
+def aggregate_weight_updates(
+    updates_list,
+    client_weights
+):
+    aggregated_updates = {
+        name: torch.zeros_like(updates_list[0][name])
+        for name in updates_list[0].keys()
+    }
 
-    for updates in updates_list:
+    for updates, weight in zip(
+        updates_list,
+        client_weights
+    ):
         for name, update in updates.items():
-            aggregated_updates[name] += update
 
-    # 计算平均权重更新
-    for name in aggregated_updates.keys():
-        aggregated_updates[name] /= len(updates_list)
+            # BN 的 num_batches_tracked 是整数，
+            # 不适合乘浮点权重，保持其更新量为 0
+            if not torch.is_floating_point(update):
+                continue
+
+            aggregated_updates[name] += (
+                update * weight
+            )
 
     return aggregated_updates
+# def aggregate_weight_updates(updates_list):
+#     # 初始化聚合后的权重更新
+#     aggregated_updates = {name: torch.zeros_like(updates_list[0][name]) for name in updates_list[0].keys()}
+
+#     for updates in updates_list:
+#         for name, update in updates.items():
+#             aggregated_updates[name] += update
+
+#     # 计算平均权重更新
+#     for name in aggregated_updates.keys():
+#         aggregated_updates[name] /= len(updates_list)
+
+#     return aggregated_updates
 
 
 # 定义全局模型更新函数
@@ -362,6 +387,14 @@ for round in range(num_rounds):
     client_losses = []
     grads_list = []
 
+    # client_train 返回的真实客户端模型更新，
+    # 最终用于更新 global_model
+    client_updates_list = []
+
+    # 全部 batch 正常训练的客户端 loss，
+    # 用于控制台打印
+    client_train_losses = []
+
     for i in range(num_clients):
         client_model.load_state_dict(
             pseudo_net.state_dict()
@@ -376,7 +409,7 @@ for round in range(num_rounds):
             weight_decay=weight_decay
         )
 
-        loss, weight_updates = client_train_1(
+        probe_loss, pseudo_grads = client_train_1(
             client_model,
             train_dataloaders[i],
             criterion,
@@ -384,10 +417,45 @@ for round in range(num_rounds):
             num_epochs,
             num_batches
         )
+        client_losses.append(
+            probe_loss.item()
+        )
 
-        grads_list.append(weight_updates)
-        client_losses.append(loss.item())
+        grads_list.append(
+            pseudo_grads
+        )
 
+        client_model.load_state_dict(
+            pseudo_net.state_dict()
+        )
+
+        # loss, weight_updates = client_train_1(
+        #     client_model,
+        #     train_dataloaders[i],
+        #     criterion,
+        #     client_optimizer,
+        #     num_epochs,
+        #     num_batches
+        # )
+        weight_updates, train_loss = client_train(
+            client_model,
+            train_dataloaders[i],
+            criterion,
+            client_optimizer,
+            num_epochs,
+
+            # 使用当前客户端全部 batch
+            len(train_dataloaders[i])
+        )
+        # grads_list.append(weight_updates)
+        # client_losses.append(loss.item())
+        client_updates_list.append(
+            weight_updates
+        )
+
+        client_train_losses.append(
+            train_loss
+        )
         del client_optimizer
 
 
@@ -395,7 +463,7 @@ for round in range(num_rounds):
         client_losses
     ).view(-1, 1).to(device)
 
-    avg_client_loss = client_losses_tensor.mean().item()        
+    avg_client_loss = (sum(client_train_losses) / len(client_train_losses))        
 
     # ==================================================
     # 根据参数选择聚合权重
@@ -511,10 +579,23 @@ for round in range(num_rounds):
 
 
     # 两种模式都更新全局模型
-    global_model.load_state_dict(
-        pseudo_net.state_dict()
+    # global_model.load_state_dict(
+    #     pseudo_net.state_dict()
+    # )
+    # 使用本轮 meta_net 已经输出的权重，
+    # 聚合 client_train() 产生的真实客户端更新。
+    aggregated_updates = aggregate_weight_updates(
+        client_updates_list,
+        pseudo_weight.detach()
     )
 
+    update_model(
+        global_model,
+        aggregated_updates
+    )
+
+    del aggregated_updates
+    del client_updates_list
 
     # 只有 MLP 模式打印元网络输出
     if aggregation == 'mlp':
