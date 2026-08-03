@@ -471,24 +471,24 @@ for round in range(num_rounds):
     if aggregation == 'mlp':
 
         # MLP 输出形状为 [num_clients, 1]
-        raw_weights = meta_net(
+        probe_raw_weights = meta_net(
             client_losses_tensor.data
         ).squeeze(1)
 
         # 归一化为权重和等于 1
-        pseudo_weight = (
-            raw_weights
-            / raw_weights.sum().clamp_min(1e-12)
+        probe_weight = (
+            probe_raw_weights
+            / probe_raw_weights.sum().clamp_min(1e-12)
         )
 
-        print("raw_weights:", raw_weights)
-        print("pseudo_weight:", pseudo_weight)
-        print("weight_sum:", pseudo_weight.sum())
+        print("probe_raw_weights:", probe_raw_weights)
+        print("probe_weight:", probe_weight)
+        print("probe_weight_sum:", probe_weight.sum())
 
     elif aggregation == 'fedavg':
 
         # FedAvg：所有客户端等权平均
-        pseudo_weight = torch.full(
+        probe_weight = torch.full(
             (num_clients,),
             1.0 / num_clients,
             device=device
@@ -513,7 +513,7 @@ for round in range(num_rounds):
 
     for grads, weight in zip(
         grads_list,
-        pseudo_weight
+        probe_weight
     ):
         for i, grad in enumerate(grads):
             aggregated_grads[i] += (
@@ -564,6 +564,51 @@ for round in range(num_rounds):
 
         meta_optimizer.step()
 
+        # ==================================================
+        # 第二次输入：
+        # 客户端全部 batch 训练 loss
+        # -> 更新后的 meta_net
+        # -> 最终聚合权重
+        # ==================================================
+        client_train_losses_tensor = torch.tensor(
+            client_train_losses,
+            dtype=torch.float32,
+            device=device
+        ).view(-1, 1)
+
+        # 最终权重只用于真实模型聚合，
+        # 不需要建立新的反向传播计算图。
+        with torch.no_grad():
+
+            final_raw_weights = meta_net(
+                client_train_losses_tensor
+            ).squeeze(1)
+
+            final_weight = (
+                final_raw_weights
+                / final_raw_weights.sum().clamp_min(1e-12)
+            )
+
+        print(
+            "client_train_losses_tensor:",
+            client_train_losses_tensor.squeeze(1)
+        )
+
+        print(
+            "final_raw_weights:",
+            final_raw_weights
+        )
+
+        print(
+            "final_weight:",
+            final_weight
+        )
+
+        print(
+            "final_weight_sum:",
+            final_weight.sum()
+        )
+
         print(
             'meta_loss: ',
             meta_loss
@@ -577,6 +622,15 @@ for round in range(num_rounds):
     else:
         del aggregated_grads
 
+        # FedAvg 不使用元网络，
+        # 最终真实模型聚合仍然等权。
+        final_weight = torch.full(
+            (num_clients,),
+            1.0 / num_clients,
+            dtype=torch.float32,
+            device=device
+        )
+
 
     # 两种模式都更新全局模型
     # global_model.load_state_dict(
@@ -586,7 +640,7 @@ for round in range(num_rounds):
     # 聚合 client_train() 产生的真实客户端更新。
     aggregated_updates = aggregate_weight_updates(
         client_updates_list,
-        pseudo_weight.detach()
+        final_weight.detach()
     )
 
     update_model(
