@@ -276,8 +276,118 @@ class WideResNet(MetaModule):
         out = out.view(-1, self.nChannels)
         return self.fc(out)
 
+class MetaMLPExpert(MetaModule):
+    """
+    单个 MLP 专家：
+    feature -> hidden -> class logits
+    """
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_classes
+    ):
+        super(MetaMLPExpert, self).__init__()
+
+        self.fc1 = MetaLinear(
+            input_dim,
+            hidden_dim
+        )
+
+        self.fc2 = MetaLinear(
+            hidden_dim,
+            num_classes
+        )
+
+    def forward(self, x):
+        x = F.relu(
+            self.fc1(x)
+        )
+
+        x = self.fc2(x)
+
+        return x
+
+
+class MetaMoEHead(MetaModule):
+    """
+    稠密 MoE 分类头。
+
+    每个样本都会经过全部专家，
+    gate 输出每个专家的混合权重。
+    """
+    def __init__(
+        self,
+        input_dim,
+        num_classes,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+        super(MetaMoEHead, self).__init__()
+
+        self.num_experts = num_experts
+
+        # 多个 MLP 专家
+        self.experts = nn.ModuleList([
+            MetaMLPExpert(
+                input_dim=input_dim,
+                hidden_dim=expert_hidden_dim,
+                num_classes=num_classes
+            )
+            for _ in range(num_experts)
+        ])
+
+        # gate：
+        # 输入特征 -> 每个专家的分数
+        self.gate = MetaLinear(
+            input_dim,
+            num_experts
+        )
+
+        # 仅用于日志观察
+        self.last_gate_weights = None
+
+    def forward(self, x):
+
+        # [batch_size, num_experts]
+        gate_logits = self.gate(x)
+
+        gate_weights = torch.softmax(
+            gate_logits,
+            dim=1
+        )
+
+        # 每个专家输出：
+        # [batch_size, num_classes]
+        expert_outputs = [
+            expert(x)
+            for expert in self.experts
+        ]
+
+        # [batch_size, num_experts, num_classes]
+        expert_outputs = torch.stack(
+            expert_outputs,
+            dim=1
+        )
+
+        # 保存 gate 权重供日志查看
+        self.last_gate_weights = (
+            gate_weights.detach()
+        )
+
+        # [batch_size, num_experts, 1]
+        gate_weights = gate_weights.unsqueeze(-1)
+
+        # 按 gate 权重混合全部专家输出
+        output = torch.sum(
+            expert_outputs * gate_weights,
+            dim=1
+        )
+
+        return output
+
 class SmallMetaConvNet(MetaModule):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10,num_experts=4,expert_hidden_dim=128):
         super(SmallMetaConvNet, self).__init__()
 
         # Define a simple sequential model using MetaConv2d and MetaLinear
@@ -287,7 +397,8 @@ class SmallMetaConvNet(MetaModule):
         self.bn2 = MetaBatchNorm2d(32)
         self.conv3 = MetaConv2d(32, 64, kernel_size=3, stride=1, padding=1)
         self.bn3 = MetaBatchNorm2d(64)
-        self.fc = MetaLinear(64 * 4 * 4, num_classes)
+        self.feature_dim = 64 * 4 * 4
+        self.fc = MetaMoEHead(input_dim=self.feature_dim, num_classes=num_classes,num_experts=num_experts,expert_hidden_dim=expert_hidden_dim)
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))

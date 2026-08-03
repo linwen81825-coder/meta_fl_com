@@ -12,8 +12,8 @@ import argparse
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def build_model(dataset, layers=10, widen_factor=2, droprate=0):
-# def build_model(dataset):
+# def build_model(dataset, layers=10, widen_factor=2, droprate=0):
+def build_model(dataset):
 #     if dataset == 'cifar10':
 #         model = ResNet18(num_classes=10)
 
@@ -40,34 +40,10 @@ def build_model(dataset, layers=10, widen_factor=2, droprate=0):
     #     dropRate=droprate
     # )
 
-    # if dataset == 'cifar10':
-    #     model = SmallMetaConvNet(num_classes=10)
-    # elif dataset == 'cifar100':
-    #     model = SmallMetaConvNet(num_classes=100)
-    # elif dataset == 'clothing1m':
-    #     model = SmallMetaConvNet1(num_classes=14)
-
-    # if torch.cuda.is_available():
-    #     model.cuda()
-    #     torch.backends.cudnn.benchmark = True
-
-    # return model
-
-
     if dataset == 'cifar10':
-        model = WideResNet(
-            layers,
-            10,
-            widen_factor,
-            dropRate=droprate
-        )
+        model = SmallMetaConvNet(num_classes=10)
     elif dataset == 'cifar100':
-        model = WideResNet(
-            layers,
-            100,
-            widen_factor,
-            dropRate=droprate
-        )
+        model = SmallMetaConvNet(num_classes=100)
     elif dataset == 'clothing1m':
         model = SmallMetaConvNet1(num_classes=14)
 
@@ -76,6 +52,30 @@ def build_model(dataset, layers=10, widen_factor=2, droprate=0):
         torch.backends.cudnn.benchmark = True
 
     return model
+
+
+    # if dataset == 'cifar10':
+    #     model = WideResNet(
+    #         layers,
+    #         10,
+    #         widen_factor,
+    #         dropRate=droprate
+    #     )
+    # elif dataset == 'cifar100':
+    #     model = WideResNet(
+    #         layers,
+    #         100,
+    #         widen_factor,
+    #         dropRate=droprate
+    #     )
+    # elif dataset == 'clothing1m':
+    #     model = SmallMetaConvNet1(num_classes=14)
+
+    # if torch.cuda.is_available():
+    #     model.cuda()
+    #     torch.backends.cudnn.benchmark = True
+
+    # return model
 
 
 def client_train(model, train_loader, criterion, optimizer, num_epochs, num_batches):
@@ -223,6 +223,27 @@ parser.add_argument(
     help='Aggregation method: mlp or fedavg.'
 )
 
+parser.add_argument(
+    '--expert',
+    type=str,
+    default=None,
+    choices=['mlp', 'fedavg'],
+    help=(
+        'Aggregation method for expert parameters. '
+        'Default: use --aggregation.'
+    )
+)
+
+parser.add_argument(
+    '--nonexpert',
+    type=str,
+    default=None,
+    choices=['mlp', 'fedavg'],
+    help=(
+        'Aggregation method for non-expert parameters. '
+        'Default: use --aggregation.'
+    )
+)
 
 # 解析命令行参数
 args = parser.parse_args()
@@ -232,8 +253,30 @@ dirichlet_alpha = args.dirichlet_alpha
 num_selected = args.num_selected
 dataset = args.dataset
 aggregation = args.aggregation
+# --expert 未指定时，继承 --aggregation
+expert_aggregation = (
+    args.expert
+    if args.expert is not None
+    else aggregation
+)
 
+# --nonexpert 未指定时，继承 --aggregation
+nonexpert_aggregation = (
+    args.nonexpert
+    if args.nonexpert is not None
+    else aggregation
+)
 
+# 只要任意一组参数使用 MLP，就需要运行元网络
+use_mlp = (
+    expert_aggregation == 'mlp'
+    or nonexpert_aggregation == 'mlp'
+)
+
+print('default aggregation =',aggregation)
+
+print('expert aggregation =',expert_aggregation)
+print('nonexpert aggregation =',nonexpert_aggregation)
 print('dataset = ', dataset)
 print('aggregation = ', aggregation)
 
@@ -350,6 +393,13 @@ time_str = now.strftime('%m%d_%H%M')
 
 best_acc = 0.0
 
+fedavg_weight = torch.full(
+    (num_clients,),
+    1.0 / num_clients,
+    dtype=torch.float32,
+    device=device
+)
+
 for round in range(num_rounds):
 
     pseudo_net = build_model(dataset)
@@ -395,62 +445,79 @@ for round in range(num_rounds):
         client_losses
     ).view(-1, 1).to(device)
 
-    avg_client_loss = client_losses_tensor.mean().item()        
-
-    # ==================================================
-    # 根据参数选择聚合权重
-    # ==================================================
-    if aggregation == 'mlp':
-
-        # MLP 输出形状为 [num_clients, 1]
+    if use_mlp:
         raw_weights = meta_net(
-            client_losses_tensor.data
+            client_losses_tensor
         ).squeeze(1)
 
-        # 归一化为权重和等于 1
-        pseudo_weight = (
+        mlp_weight = (
             raw_weights
             / raw_weights.sum().clamp_min(1e-12)
         )
+        print("raw_weights:",raw_weights)
+        print("mlp_weight:",mlp_weight)
+        print("mlp_weight_sum:",mlp_weight.sum())
+    else:
+        mlp_weight = fedavg_weight
 
-        print("raw_weights:", raw_weights)
-        print("pseudo_weight:", pseudo_weight)
-        print("weight_sum:", pseudo_weight.sum())
+    avg_client_loss = client_losses_tensor.mean().item()        
 
-    elif aggregation == 'fedavg':
-
-        # FedAvg：所有客户端等权平均
-        pseudo_weight = torch.full(
-            (num_clients,),
-            1.0 / num_clients,
-            device=device
-        )
-
-        # print(
-        #     "FedAvg weight:",
-        #     pseudo_weight[0]
-        # )
-
-        # print(
-        #     "weight_sum:",
-        #     pseudo_weight.sum()
-        # )
 
 
     # 聚合客户端梯度
-    aggregated_grads = [
-        torch.zeros_like(grad)
-        for grad in grads_list[0]
+    # ==================================================
+    # 按专家参数和非专家参数分别选择聚合方式
+    # ==================================================
+
+    # 参数名称的顺序必须和 client_train_1() 中
+    # model.params() 返回的梯度顺序一致
+    param_names = [
+        name
+        for name, _ in pseudo_net.named_params(pseudo_net)
     ]
 
-    for grads, weight in zip(
-        grads_list,
-        pseudo_weight
+    if len(param_names) != len(grads_list[0]):
+        raise RuntimeError(
+            "参数名称数量与客户端梯度数量不一致"
+        )
+
+    aggregated_grads = []
+
+    for param_index, param_name in enumerate(
+        param_names
     ):
-        for i, grad in enumerate(grads):
-            aggregated_grads[i] += (
-                grad * weight
+        # ----------------------------------------------
+        # 1. 判断当前参数属于专家还是非专家
+        # ----------------------------------------------
+        if param_name.startswith("fc.experts."):
+            current_aggregation = expert_aggregation
+        else:
+            current_aggregation = nonexpert_aggregation
+
+        # ----------------------------------------------
+        # 2. 根据配置选择 MLP 或 FedAvg 权重
+        # ----------------------------------------------
+        if current_aggregation == 'mlp':
+            current_weights = mlp_weight
+        else:
+            current_weights = fedavg_weight
+
+        # ----------------------------------------------
+        # 3. 聚合当前参数的所有客户端梯度
+        # ----------------------------------------------
+        aggregated_grad = torch.zeros_like(
+            grads_list[0][param_index]
+        )
+
+        for client_id in range(num_clients):
+            aggregated_grad += (
+                grads_list[client_id][param_index]
+                * current_weights[client_id]
             )
+
+        aggregated_grads.append(
+            aggregated_grad
+        )
 
 
     # 更新伪模型
@@ -463,7 +530,7 @@ for round in range(num_rounds):
     # ==================================================
     # 只有 MLP 模式更新元学习网络
     # ==================================================
-    if aggregation == 'mlp':
+    if use_mlp:
 
         del aggregated_grads
 
@@ -517,7 +584,7 @@ for round in range(num_rounds):
 
 
     # 只有 MLP 模式打印元网络输出
-    if aggregation == 'mlp':
+    if use_mlp:
 
         test_train_losses = torch.arange(
             num_clients,
@@ -559,7 +626,7 @@ for round in range(num_rounds):
 
 
     # MLP 模式保存元网络
-    if aggregation == 'mlp':
+    if use_mlp:
         torch.save(
             meta_net.state_dict(),
             (
