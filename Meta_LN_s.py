@@ -220,37 +220,6 @@ parser.add_argument(
     help='Number of selected items.'
 )
 
-# 新增：选择 MLP 加权或 FedAvg 等权平均
-parser.add_argument(
-    '--aggregation',
-    type=str,
-    default='mlp',
-    choices=['mlp', 'fedavg'],
-    help='Aggregation method: mlp or fedavg.'
-)
-
-parser.add_argument(
-    '--expert',
-    type=str,
-    default=None,
-    choices=['mlp', 'fedavg'],
-    help=(
-        'Aggregation method for expert parameters. '
-        'Default: use --aggregation.'
-    )
-)
-
-parser.add_argument(
-    '--nonexpert',
-    type=str,
-    default=None,
-    choices=['mlp', 'fedavg'],
-    help=(
-        'Aggregation method for non-expert parameters. '
-        'Default: use --aggregation.'
-    )
-)
-
 # 解析命令行参数
 args = parser.parse_args()
 
@@ -258,33 +227,9 @@ use_dirichlet = args.use_dirichlet.lower() == 'true'
 dirichlet_alpha = args.dirichlet_alpha
 num_selected = args.num_selected
 dataset = args.dataset
-aggregation = args.aggregation
-# --expert 未指定时，继承 --aggregation
-expert_aggregation = (
-    args.expert
-    if args.expert is not None
-    else aggregation
-)
-
-# --nonexpert 未指定时，继承 --aggregation
-nonexpert_aggregation = (
-    args.nonexpert
-    if args.nonexpert is not None
-    else aggregation
-)
-
-# 只要任意一组参数使用 MLP，就需要运行元网络
-use_mlp = (
-    expert_aggregation == 'mlp'
-    or nonexpert_aggregation == 'mlp'
-)
-
-print('default aggregation =',aggregation)
-
-print('expert aggregation =',expert_aggregation)
-print('nonexpert aggregation =',nonexpert_aggregation)
+print('expert aggregation = mlp')
+print('nonexpert aggregation = fedavg')
 print('dataset = ', dataset)
-print('aggregation = ', aggregation)
 
 
 if dataset == 'clothing1m':
@@ -353,7 +298,7 @@ else:
 
 # 初始化模型和优化器
 global_model = build_model(dataset)
-
+num_experts = global_model.fc.num_experts
 criterion = nn.CrossEntropyLoss()
 
 optimizer_model = torch.optim.SGD(
@@ -371,7 +316,8 @@ client_model = build_model(dataset).to(device)
 # 初始化元学习网络
 meta_net = MLP(
     hidden_size=meta_net_hidden_size,
-    num_layers=meta_net_num_layers
+    num_layers=meta_net_num_layers,
+    output_size=num_experts
 ).to(device)
 
 meta_optimizer = torch.optim.Adam(
@@ -451,20 +397,35 @@ for round in range(num_rounds):
         client_losses
     ).view(-1, 1).to(device)
 
-    if use_mlp:
-        raw_weights = meta_net(
-            client_losses_tensor
-        ).squeeze(1)
+    # [num_clients, num_experts]
+    raw_expert_weights = meta_net(
+        client_losses_tensor
+    )
 
-        mlp_weight = (
-            raw_weights
-            / raw_weights.sum().clamp_min(1e-12)
-        )
-        print("raw_weights:",raw_weights)
-        print("mlp_weight:",mlp_weight)
-        print("mlp_weight_sum:",mlp_weight.sum())
-    else:
-        mlp_weight = fedavg_weight
+    # 每个专家分别沿客户端维度归一化。
+    # expert_weights[:, expert_id].sum() == 1
+    expert_weights = (
+        raw_expert_weights
+        / raw_expert_weights.sum(
+            dim=0,
+            keepdim=True
+        ).clamp_min(1e-12)
+    )
+
+    print(
+        "raw_expert_weights:",
+        raw_expert_weights
+    )
+
+    print(
+        "expert_weights:",
+        expert_weights
+    )
+
+    print(
+        "expert_weight_sums:",
+        expert_weights.sum(dim=0)
+    )
 
     avg_client_loss = client_losses_tensor.mean().item()        
 
@@ -496,16 +457,20 @@ for round in range(num_rounds):
         # 1. 判断当前参数属于专家还是非专家
         # ----------------------------------------------
         if param_name.startswith("fc.experts."):
-            current_aggregation = expert_aggregation
-        else:
-            current_aggregation = nonexpert_aggregation
+            # 参数名示例：
+            # fc.experts.0.fc1.weight
+            # fc.experts.1.fc2.bias
+            expert_id = int(
+                param_name.split('.')[2]
+            )
 
-        # ----------------------------------------------
-        # 2. 根据配置选择 MLP 或 FedAvg 权重
-        # ----------------------------------------------
-        if current_aggregation == 'mlp':
-            current_weights = mlp_weight
+            # 当前专家专属的客户端权重
+            current_weights = (
+                expert_weights[:, expert_id]
+            )
         else:
+            # 卷积层、BN参数、Gate和其他非专家参数
+            # 继续使用客户端等权平均
             current_weights = fedavg_weight
 
         # ----------------------------------------------
@@ -534,54 +499,48 @@ for round in range(num_rounds):
 
 
     # ==================================================
-    # 只有 MLP 模式更新元学习网络
+    # 更新元学习网络
     # ==================================================
-    if use_mlp:
+    del aggregated_grads
 
-        del aggregated_grads
-
-        try:
-            meta_inputs, meta_labels = next(
-                meta_dataloader_iter
-            )
-        except StopIteration:
-            meta_dataloader_iter = iter(
-                meta_dataloader
-            )
-
-            meta_inputs, meta_labels = next(
-                meta_dataloader_iter
-            )
-
-        meta_inputs = meta_inputs.to(device)
-        meta_labels = meta_labels.to(device)
-
-        meta_outputs = pseudo_net(meta_inputs)
-
-        meta_loss = criterion(
-            meta_outputs,
-            meta_labels.long()
+    try:
+        meta_inputs, meta_labels = next(
+            meta_dataloader_iter
+        )
+    except StopIteration:
+        meta_dataloader_iter = iter(
+            meta_dataloader
         )
 
-        meta_optimizer.zero_grad()
-
-        meta_loss.backward()
-
-        meta_optimizer.step()
-
-        print(
-            'meta_loss: ',
-            meta_loss
+        meta_inputs, meta_labels = next(
+            meta_dataloader_iter
         )
 
-        print(
-            'meta_net.linear1.weight after: ',
-            meta_net.output_layer.weight[0, 0:5]
-        )
+    meta_inputs = meta_inputs.to(device)
+    meta_labels = meta_labels.to(device)
 
-    else:
-        del aggregated_grads
+    meta_outputs = pseudo_net(meta_inputs)
 
+    meta_loss = criterion(
+        meta_outputs,
+        meta_labels.long()
+    )
+
+    meta_optimizer.zero_grad()
+
+    meta_loss.backward()
+
+    meta_optimizer.step()
+
+    print(
+        'meta_loss: ',
+        meta_loss
+    )
+
+    print(
+        'meta_net.output_layer.weight after: ',
+        meta_net.output_layer.weight[:, 0:5]
+    )
 
     # 两种模式都更新全局模型
     global_model.load_state_dict(
@@ -589,29 +548,43 @@ for round in range(num_rounds):
     )
 
 
-    # 只有 MLP 模式打印元网络输出
-    if use_mlp:
+    test_train_losses = torch.arange(
+        num_clients,
+        dtype=torch.float32
+    ).to(device)
 
-        test_train_losses = torch.arange(
-            num_clients,
-            dtype=torch.float32
-        ).to(device)
+    print(
+        "test_train_losses: ",
+        test_train_losses
+    )
 
-        print(
-            "test_train_losses: ",
+    test_train_losses = torch.reshape(
+        test_train_losses,
+        (len(test_train_losses), 1)
+    )
+
+    with torch.no_grad():
+        test_raw_expert_weights = meta_net(
             test_train_losses
         )
 
-        test_train_losses = torch.reshape(
-            test_train_losses,
-            (len(test_train_losses), 1)
+        test_expert_weights = (
+            test_raw_expert_weights
+            / test_raw_expert_weights.sum(
+                dim=0,
+                keepdim=True
+            ).clamp_min(1e-12)
         )
 
-        print(
-            'test_out:',
-            meta_net(test_train_losses)
-        )
+    print(
+        'test_expert_weights:',
+        test_expert_weights
+    )
 
+    print(
+        'test_expert_weight_sums:',
+        test_expert_weights.sum(dim=0)
+    )
 
     test_loss, test_accuracy = test_model(
         global_model,
@@ -631,23 +604,21 @@ for round in range(num_rounds):
     )
 
 
-    # MLP 模式保存元网络
-    if use_mlp:
-        torch.save(
-            meta_net.state_dict(),
-            (
-                f'./save/mlp_model_s_LN'
-                f'{num_selected}_N{num_clients}_'
-                f'BS{batch_size}_{dataset}_'
-                f'{time_str}.pth'
-            )
+    torch.save(
+        meta_net.state_dict(),
+        (
+            f'./save/mlp_model_s_LN'
+            f'{num_selected}_N{num_clients}_'
+            f'BS{batch_size}_{dataset}_'
+            f'{time_str}.pth'
         )
+    )
 
     # 两种模式都保存全局模型
     torch.save(
         global_model.state_dict(),
         (
-            f'./save/{aggregation}_'
+            f'./save/expert_mlp_nonexpert_fedavg_'
             f'global_model_s_LN'
             f'{num_selected}_N{num_clients}_'
             f'BS{batch_size}_{dataset}_'
