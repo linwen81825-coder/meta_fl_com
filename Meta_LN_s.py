@@ -6,6 +6,7 @@ from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,Re
 import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
+import math
 
 
 # 检查是否有可用的GPU
@@ -195,21 +196,21 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--dataset',
     type=str,
-    default='clothing1m',
+    default='cifar10',
     help='The name of the dataset.'
 )
 
 parser.add_argument(
     '--use_dirichlet',
     type=str,
-    default='false',
+    default='true',
     help='Whether to use Dirichlet distribution for data splitting.'
 )
 
 parser.add_argument(
     '--dirichlet_alpha',
     type=float,
-    default=0.5,
+    default=0.1,
     help='Alpha parameter for the Dirichlet distribution.'
 )
 
@@ -252,14 +253,15 @@ meta_bs = 128
 meta_sample_number = 1000
 
 # FL model parameters
-lr = 0.1
+lr = 0.03
+min_lr = 0.0003
 decay_factor = 0.996
 
 # Meta model parameters
 meta_net_hidden_size = 500
 meta_net_num_layers = 1
 meta_lr = 1e-4
-meta_weight_decay = 0.
+meta_weight_decay = 0
 
 nesterov = True
 momentum = 0.9
@@ -354,6 +356,19 @@ fedavg_weight = torch.full(
 
 for round in range(num_rounds):
 
+    # 模型学习率余弦退火：从 lr 平滑衰减到 min_lr。
+    current_lr = (
+        min_lr
+        + 0.5
+        * (lr - min_lr)
+        * (
+            1.0
+            + math.cos(
+                math.pi * round / num_rounds
+            )
+        )
+    )
+
     pseudo_net = build_model(dataset)
 
     pseudo_net.load_state_dict(
@@ -372,7 +387,7 @@ for round in range(num_rounds):
         # 每个客户端使用新的独立优化器
         client_optimizer = torch.optim.SGD(
             client_model.params(),
-            lr=lr,
+            lr=current_lr,
             momentum=momentum,
             nesterov=nesterov,
             weight_decay=weight_decay
@@ -493,7 +508,7 @@ for round in range(num_rounds):
 
     # 更新伪模型
     pseudo_net.update_params(
-        lr_inner=lr,
+        lr_inner=current_lr,
         source_params=aggregated_grads
     )
 

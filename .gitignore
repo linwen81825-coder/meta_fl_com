@@ -3,7 +3,7 @@
 
 # 允许上传的文件
 !.gitignore
-
+!.Meta_LN_s1.py
 !.Meta_LN_s.py
 
 !.FedAvg_LN_s.py

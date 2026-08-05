@@ -480,36 +480,124 @@ class SmallMetaConvNet1(MetaModule):
 
 
 class ResNet18(MetaModule):
-    def __init__(self, num_classes, block=MetaBasicBlock, num_blocks=[2, 2, 2, 2]):
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128,
+        block=MetaBasicBlock,
+        num_blocks=(2, 2, 2, 2)
+    ):
         super(ResNet18, self).__init__()
+
         self.in_planes = 64
 
-        self.conv1 = MetaConv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = MetaBatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.linear = MetaLinear(512, num_classes)
+        # CIFAR-10/CIFAR-100 使用 3×3、stride=1，
+        # 不使用 ImageNet ResNet 的 7×7 卷积和 maxpool。
+        self.conv1 = MetaConv2d(
+            3,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
 
-    def _make_layer(self, block, planes, num_blocks, stride):
+        self.bn1 = MetaBatchNorm2d(64)
+
+        self.layer1 = self._make_layer(
+            block,
+            64,
+            num_blocks[0],
+            stride=1
+        )
+
+        self.layer2 = self._make_layer(
+            block,
+            128,
+            num_blocks[1],
+            stride=2
+        )
+
+        self.layer3 = self._make_layer(
+            block,
+            256,
+            num_blocks[2],
+            stride=2
+        )
+
+        self.layer4 = self._make_layer(
+            block,
+            512,
+            num_blocks[3],
+            stride=2
+        )
+
+        self.feature_dim = 512 * block.expansion
+
+        # 必须命名为 self.fc。
+        #
+        # 训练代码依赖：
+        # global_model.fc.num_experts
+        # fc.experts.0.fc1.weight
+        # fc.experts.1.fc2.bias
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+    def _make_layer(
+        self,
+        block,
+        planes,
+        num_blocks,
+        stride
+    ):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
+
+        for current_stride in strides:
+            layers.append(
+                block(
+                    self.in_planes,
+                    planes,
+                    current_stride
+                )
+            )
+
+            self.in_planes = (
+                planes * block.expansion
+            )
 
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.avg_pool2d(out, out.size()[3])
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
+
+        # [B, 512, H, W] -> [B, 512, 1, 1]
+        out = F.adaptive_avg_pool2d(
+            out,
+            output_size=1
+        )
+
+        # [B, 512, 1, 1] -> [B, 512]
+        out = torch.flatten(
+            out,
+            start_dim=1
+        )
+
+        # ResNet18特征送入MoE分类头。
+        out = self.fc(out)
+
         return out
 
 class ResNet(MetaModule):
