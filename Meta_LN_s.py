@@ -166,6 +166,27 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
     optimizer.zero_grad()
 
     output = model(data)
+
+    # Top-1 专家激活频率。
+    # last_selected_expert shape: [batch_size]
+    selected_expert = model.fc.last_selected_expert
+
+    if selected_expert is None:
+        raise RuntimeError(
+            'model.fc.last_selected_expert is None.'
+        )
+
+    expert_activation_frequency = (
+        torch.bincount(
+            selected_expert.reshape(-1),
+            minlength=model.fc.num_experts
+        ).to(
+            device=device,
+            dtype=torch.float32
+        )
+        / data.size(0)
+    )
+
     loss = criterion(output, target)
     model_params = tuple(model.params())
     # 计算权重更新量
@@ -187,7 +208,11 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
         )
     )
 
-    return loss.detach(), pseudo_grads
+    return (
+        loss.detach(),
+        expert_activation_frequency.detach(),
+        pseudo_grads
+    )
 
 parser = argparse.ArgumentParser(
     description='Your script description.'
@@ -317,9 +342,10 @@ client_model = build_model(dataset).to(device)
 
 # 初始化元学习网络
 meta_net = MLP(
+    input_size=2,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
-    output_size=num_experts
+    output_size=1
 ).to(device)
 
 meta_optimizer = torch.optim.Adam(
@@ -377,6 +403,7 @@ for round in range(num_rounds):
 
     # 客户端训练并上传权重更新
     client_losses = []
+    client_expert_frequencies = []
     grads_list = []
 
     for i in range(num_clients):
@@ -393,7 +420,11 @@ for round in range(num_rounds):
             weight_decay=weight_decay
         )
 
-        loss, weight_updates = client_train_1(
+        (
+            loss,
+            expert_activation_frequency,
+            weight_updates
+        ) = client_train_1(
             client_model,
             train_dataloaders[i],
             criterion,
@@ -404,6 +435,9 @@ for round in range(num_rounds):
 
         grads_list.append(weight_updates)
         client_losses.append(loss.item())
+        client_expert_frequencies.append(
+            expert_activation_frequency
+        )
 
         del client_optimizer
 
@@ -412,9 +446,50 @@ for round in range(num_rounds):
         client_losses
     ).view(-1, 1).to(device)
 
+    client_expert_frequencies_tensor = torch.stack(
+        client_expert_frequencies,
+        dim=0
+    ).to(device)
     # [num_clients, num_experts]
-    raw_expert_weights = meta_net(
+
+    # 不对 loss 做标准化。
+    # 对客户端 k、专家 e 构造：
+    # [client_loss_k, activation_frequency_k_e]
+    loss_features = (
         client_losses_tensor
+        .unsqueeze(1)
+        .expand(
+            -1,
+            num_experts,
+            -1
+        )
+    )
+    # [num_clients, num_experts, 1]
+
+    frequency_features = (
+        client_expert_frequencies_tensor
+        .unsqueeze(-1)
+    )
+    # [num_clients, num_experts, 1]
+
+    client_expert_features = torch.cat(
+        [
+            loss_features,
+            frequency_features
+        ],
+        dim=2
+    )
+    # [num_clients, num_experts, 2]
+
+    # 每个客户端-专家对输出一个客户端聚合权重分数。
+    raw_expert_weights = meta_net(
+        client_expert_features.reshape(
+            -1,
+            2
+        )
+    ).view(
+        num_clients,
+        num_experts
     )
 
     # 每个专家分别沿客户端维度归一化。
@@ -578,9 +653,38 @@ for round in range(num_rounds):
         (len(test_train_losses), 1)
     )
 
+    test_loss_features = (
+        test_train_losses
+        .unsqueeze(1)
+        .expand(
+            -1,
+            num_experts,
+            -1
+        )
+    )
+
+    test_frequency_features = (
+        client_expert_frequencies_tensor
+        .unsqueeze(-1)
+    )
+
+    test_client_expert_features = torch.cat(
+        [
+            test_loss_features,
+            test_frequency_features
+        ],
+        dim=2
+    )
+
     with torch.no_grad():
         test_raw_expert_weights = meta_net(
-            test_train_losses
+            test_client_expert_features.reshape(
+                -1,
+                2
+            )
+        ).view(
+            num_clients,
+            num_experts
         )
 
         test_expert_weights = (

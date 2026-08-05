@@ -98,6 +98,7 @@ class HiddenLayer(nn.Module):
 class MLP(nn.Module):
     def __init__(
         self,
+        input_size=1,
         hidden_size=100,
         num_layers=1,
         output_size=1
@@ -105,7 +106,7 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
 
         self.first_hidden_layer = HiddenLayer(
-            1,
+            input_size,
             hidden_size
         )
 
