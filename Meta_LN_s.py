@@ -279,7 +279,7 @@ meta_sample_number = 1000
 
 # FL model parameters
 lr = 0.03
-min_lr = 0.0003
+min_lr = 0.001
 decay_factor = 0.996
 
 # Meta model parameters
@@ -515,6 +515,56 @@ for round in range(num_rounds):
     print(
         "expert_weight_sums:",
         expert_weights.sum(dim=0)
+    )
+
+    # 逐条记录元网络两个输入及对应输出权重。
+    # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
+    log_client_losses = (
+        client_losses_tensor
+        .detach()
+        .cpu()
+        .view(-1)
+    )
+
+    log_activation_frequencies = (
+        client_expert_frequencies_tensor
+        .detach()
+        .cpu()
+    )
+
+    log_raw_weights = (
+        raw_expert_weights
+        .detach()
+        .cpu()
+    )
+
+    log_normalized_weights = (
+        expert_weights
+        .detach()
+        .cpu()
+    )
+
+    meta_weight_log_lines = []
+
+    for client_id in range(num_clients):
+        for expert_id in range(num_experts):
+            meta_weight_log_lines.append(
+                "META_WEIGHT_LOG "
+                f"round_id={round + 1} "
+                f"client_id={client_id} "
+                f"expert_id={expert_id} "
+                f"client_loss={log_client_losses[client_id].item():.10f} "
+                f"activation_frequency="
+                f"{log_activation_frequencies[client_id, expert_id].item():.10f} "
+                f"raw_weight="
+                f"{log_raw_weights[client_id, expert_id].item():.10f} "
+                f"normalized_weight="
+                f"{log_normalized_weights[client_id, expert_id].item():.10f}"
+            )
+
+    print(
+        "\n".join(meta_weight_log_lines),
+        flush=True
     )
 
     avg_client_loss = client_losses_tensor.mean().item()        

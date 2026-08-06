@@ -368,7 +368,7 @@ meta_bs = 128
 meta_sample_number = 1000
 
 lr = 0.03
-min_lr = 0.0003
+min_lr = 0.001
 nesterov = True
 momentum = 0.9
 weight_decay = 5e-4
