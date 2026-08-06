@@ -3,6 +3,8 @@ import datetime
 import os
 import argparse
 import math
+import sys
+import atexit
 
 import torch
 import torch.nn as nn
@@ -18,6 +20,89 @@ from model.wideresnet import (
 device = torch.device(
     'cuda' if torch.cuda.is_available() else 'cpu'
 )
+
+
+
+class RoundOnlyConsoleLogger:
+    """
+    所有 stdout 内容都写入日志文件；
+    只有以 "Round " 开头的完整行同时显示在控制台。
+    """
+
+    def __init__(self, log_path, console_stream):
+        self.log_path = log_path
+        self.console_stream = console_stream
+        self.log_stream = open(
+            log_path,
+            mode='a',
+            encoding='utf-8',
+            buffering=1
+        )
+        self.pending_text = ''
+        self._closed = False
+
+    @property
+    def encoding(self):
+        return getattr(
+            self.console_stream,
+            'encoding',
+            'utf-8'
+        )
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self.console_stream.fileno()
+
+    def write(self, text):
+        if self._closed:
+            return 0
+        if not isinstance(text, str):
+            text = str(text)
+
+        # 完整内容始终写入日志。
+        self.log_stream.write(text)
+
+        # 控制台只输出每轮汇总行。
+        self.pending_text += text
+
+        while '\n' in self.pending_text:
+            line, self.pending_text = (
+                self.pending_text.split('\n', 1)
+            )
+
+            if line.startswith('Round '):
+                self.console_stream.write(
+                    line + '\n'
+                )
+                self.console_stream.flush()
+
+        return len(text)
+
+    def flush(self):
+        # 程序退出时，flush 可能在文件关闭后再次被调用
+        if not self.log_stream.closed:
+            self.log_stream.flush()
+
+        try:
+            self.console_stream.flush()
+        except (ValueError, OSError):
+            pass
+
+    def close(self):
+        # 避免重复关闭
+        if self._closed:
+            return
+
+        self.flush()
+
+        if not self.log_stream.closed:
+            self.log_stream.close()
+
+        self._closed = True
+
+
 
 def build_model(dataset, layers=10, widen_factor=1, droprate=0):
     if dataset == 'cifar10':
@@ -110,7 +195,8 @@ def client_train(
     optimizer,
     num_epochs,
     num_batches,
-    global_state_cpu
+    global_state_cpu,
+    load_balance_coef
 ):
     """
     单个客户端每轮训练 num_batches 个 batch。
@@ -148,12 +234,33 @@ def client_train(
             )
 
             output = model(data)
-            loss = criterion(output, target)
 
-            loss.backward()
+            cross_entropy_loss = criterion(
+                output,
+                target
+            )
+
+            load_balance_loss = (
+                model.fc.last_load_balance_loss
+            )
+
+            if load_balance_loss is None:
+                raise RuntimeError(
+                    'model.fc.last_load_balance_loss is None.'
+                )
+
+            training_loss = (
+                cross_entropy_loss
+                + load_balance_coef
+                * load_balance_loss
+            )
+
+            training_loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
+            # Client Loss 仍然记录纯交叉熵。
+            train_loss += cross_entropy_loss.item()
+
             trained_batches += 1
 
     if trained_batches == 0:
@@ -335,7 +442,7 @@ parser.add_argument(
 parser.add_argument(
     '--num_selected',
     type=int,
-    default=20,
+    default=100,
     help=(
         '保留命令行兼容性；'
         '当前 FedAvg 每轮使用全部客户端。'
@@ -350,6 +457,34 @@ use_dirichlet = (
 
 dirichlet_alpha = args.dirichlet_alpha
 dataset = args.dataset
+
+# 自动保存完整日志；控制台只显示每轮 Round 汇总行。
+log_start_time = datetime.datetime.now()
+log_time_str = log_start_time.strftime(
+    '%m%d_%H%M%S'
+)
+
+os.makedirs(
+    './log1',
+    exist_ok=True
+)
+
+log_file_path = (
+    f'./log1/FedAvg_LN_s_'
+    f'{dataset}_'
+    f'{log_time_str}.log'
+)
+
+original_stdout = sys.stdout
+round_console_logger = RoundOnlyConsoleLogger(
+    log_file_path,
+    original_stdout
+)
+
+sys.stdout = round_console_logger
+atexit.register(
+    round_console_logger.close
+)
 
 print('dataset =', dataset)
 
@@ -372,6 +507,9 @@ min_lr = 0.001
 nesterov = True
 momentum = 0.9
 weight_decay = 5e-4
+
+# Top-1 MoE 负载均衡辅助损失系数。
+load_balance_coef = 0.003
 
 if dataset == 'clothing1m':
     (
@@ -425,6 +563,54 @@ now = datetime.datetime.now()
 time_str = now.strftime('%m%d_%H%M')
 
 best_accuracy = 0.0
+
+# 训练开始时只记录一次实验配置。
+num_experts = getattr(
+    global_model.fc,
+    'num_experts',
+    'N/A'
+)
+
+experiment_config = [
+    "EXPERIMENT_CONFIG_BEGIN",
+    "method=fedavg",
+    f"start_time={now.strftime('%Y-%m-%d_%H:%M:%S')}",
+    f"log_file={log_file_path}",
+    f"device={device}",
+    f"dataset={dataset}",
+    f"use_dirichlet={use_dirichlet}",
+    f"dirichlet_alpha={dirichlet_alpha}",
+    f"num_clients={num_clients}",
+    f"clients_per_round={num_clients}",
+    f"num_selected_arg={args.num_selected}",
+    f"batch_size={batch_size}",
+    f"num_epochs={num_epochs}",
+    f"num_batches={num_batches}",
+    f"num_rounds={num_rounds}",
+    f"meta_batch_size={meta_bs}",
+    f"meta_sample_number={meta_sample_number}",
+    f"model={global_model.__class__.__name__}",
+    f"num_experts={num_experts}",
+    "routing=top1",
+    "aggregation=equal_average_full_client_updates",
+    "client_training_loss=cross_entropy+load_balance",
+    "client_loss_log=cross_entropy_only",
+    f"lr_max={lr}",
+    f"lr_min={min_lr}",
+    "lr_scheduler=cosine_annealing",
+    f"optimizer=SGD",
+    f"momentum={momentum}",
+    f"nesterov={nesterov}",
+    f"weight_decay={weight_decay}",
+    f"load_balance_coef={load_balance_coef}",
+    "client_optimizer_state=persistent_per_client_on_cpu",
+    "EXPERIMENT_CONFIG_END",
+]
+
+print(
+    "\n".join(experiment_config),
+    flush=True
+)
 
 for round_idx in range(num_rounds):
     # 余弦退火：从原始 lr 平滑衰减到 min_lr。
@@ -493,7 +679,8 @@ for round_idx in range(num_rounds):
             local_optimizer,
             num_epochs,
             num_batches,
-            global_state_cpu
+            global_state_cpu,
+            load_balance_coef
         )
 
         client_losses.append(train_loss)
@@ -552,15 +739,15 @@ for round_idx in range(num_rounds):
         flush=True
     )
 
-    torch.save(
-        global_model.state_dict(),
-        (
-            './save/'
-            'global_model_s_LN_fedavg_'
-            'resnet18_moe_single_local_'
-            f'N{num_clients}_'
-            f'BS{batch_size}_'
-            f'{dataset}_'
-            f'{time_str}.pth'
-        )
-    )
+    # torch.save(
+    #     global_model.state_dict(),
+    #     (
+    #         './save/'
+    #         'global_model_s_LN_fedavg_'
+    #         'resnet18_moe_single_local_'
+    #         f'N{num_clients}_'
+    #         f'BS{batch_size}_'
+    #         f'{dataset}_'
+    #         f'{time_str}.pth'
+    #     )
+    # )

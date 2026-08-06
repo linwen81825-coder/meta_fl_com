@@ -345,6 +345,7 @@ class MetaMoEHead(MetaModule):
 
         self.last_gate_weights = None
         self.last_selected_expert = None
+        self.last_load_balance_loss = None
 
     def forward(self, x):
         batch_size = x.size(0)
@@ -369,6 +370,25 @@ class MetaMoEHead(MetaModule):
         ).to(
             dtype=x.dtype,
             device=x.device
+        )
+
+        # Top-1 MoE 负载均衡辅助损失。
+        # expert_fraction 是当前 batch 的实际专家分配比例；
+        # router_probability 是可微的平均路由概率。
+        expert_fraction = (
+            hard_gate.detach().mean(dim=0)
+        )
+
+        router_probability = (
+            gate_probs.mean(dim=0)
+        )
+
+        self.last_load_balance_loss = (
+            self.num_experts
+            * torch.sum(
+                expert_fraction
+                * router_probability
+            )
         )
 
         # 前向为硬选择，反向通过 softmax 概率训练 Gate

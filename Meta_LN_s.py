@@ -7,10 +7,95 @@ import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
 import math
+import os
+import sys
+import atexit
 
 
 # 检查是否有可用的GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+
+class RoundOnlyConsoleLogger:
+    """
+    所有 stdout 内容都写入日志文件；
+    只有以 "Round " 开头的完整行同时显示在控制台。
+    """
+
+    def __init__(self, log_path, console_stream):
+        self.log_path = log_path
+        self.console_stream = console_stream
+        self.log_stream = open(
+            log_path,
+            mode='a',
+            encoding='utf-8',
+            buffering=1
+        )
+        self.pending_text = ''
+        self._closed = False
+
+    @property
+    def encoding(self):
+        return getattr(
+            self.console_stream,
+            'encoding',
+            'utf-8'
+        )
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self.console_stream.fileno()
+
+    def write(self, text):
+        if self._closed:
+            return 0
+        if not isinstance(text, str):
+            text = str(text)
+
+        # 完整内容始终写入日志。
+        self.log_stream.write(text)
+
+        # 控制台只输出每轮汇总行。
+        self.pending_text += text
+
+        while '\n' in self.pending_text:
+            line, self.pending_text = (
+                self.pending_text.split('\n', 1)
+            )
+
+            if line.startswith('Round '):
+                self.console_stream.write(
+                    line + '\n'
+                )
+                self.console_stream.flush()
+
+        return len(text)
+
+    def flush(self):
+        # 程序退出时，flush 可能在文件关闭后再次被调用
+        if not self.log_stream.closed:
+            self.log_stream.flush()
+
+        try:
+            self.console_stream.flush()
+        except (ValueError, OSError):
+            pass
+
+    def close(self):
+        # 避免重复关闭
+        if self._closed:
+            return
+
+        self.flush()
+
+        if not self.log_stream.closed:
+            self.log_stream.close()
+
+        self._closed = True
+
 
 
 # def build_model(dataset, layers=10, widen_factor=2, droprate=0):
@@ -187,11 +272,33 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
         / data.size(0)
     )
 
-    loss = criterion(output, target)
+    # 元网络输入仍然只使用交叉熵损失。
+    cross_entropy_loss = criterion(
+        output,
+        target
+    )
+
+    load_balance_loss = (
+        model.fc.last_load_balance_loss
+    )
+
+    if load_balance_loss is None:
+        raise RuntimeError(
+            'model.fc.last_load_balance_loss is None.'
+        )
+
+    # 负载均衡损失只参与模型梯度，
+    # 不作为元网络输入，也不加入 meta_loss。
+    training_loss = (
+        cross_entropy_loss
+        + load_balance_coef
+        * load_balance_loss
+    )
+
     model_params = tuple(model.params())
     # 计算权重更新量
     pseudo_grads = torch.autograd.grad(
-        loss,
+        training_loss,
         model_params,
         create_graph=False,
         retain_graph=False,
@@ -209,7 +316,8 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
     )
 
     return (
-        loss.detach(),
+        cross_entropy_loss.detach(),
+        load_balance_loss.detach(),
         expert_activation_frequency.detach(),
         pseudo_grads
     )
@@ -242,7 +350,7 @@ parser.add_argument(
 parser.add_argument(
     '--num_selected',
     type=int,
-    default=20,
+    default=100,
     help='Number of selected items.'
 )
 
@@ -253,6 +361,35 @@ use_dirichlet = args.use_dirichlet.lower() == 'true'
 dirichlet_alpha = args.dirichlet_alpha
 num_selected = args.num_selected
 dataset = args.dataset
+
+# 自动保存完整日志；控制台只显示每轮 Round 汇总行。
+log_start_time = datetime.datetime.now()
+log_time_str = log_start_time.strftime(
+    '%m%d_%H%M%S'
+)
+
+os.makedirs(
+    './log1',
+    exist_ok=True
+)
+
+log_file_path = (
+    f'./log1/Meta_LN_s_'
+    f'{dataset}_'
+    f'{log_time_str}.log'
+)
+
+original_stdout = sys.stdout
+round_console_logger = RoundOnlyConsoleLogger(
+    log_file_path,
+    original_stdout
+)
+
+sys.stdout = round_console_logger
+atexit.register(
+    round_console_logger.close
+)
+
 print('expert aggregation = mlp')
 print('nonexpert aggregation = fedavg')
 print('dataset = ', dataset)
@@ -291,6 +428,9 @@ meta_weight_decay = 0
 nesterov = True
 momentum = 0.9
 weight_decay = 5e-4
+
+# Top-1 MoE 负载均衡辅助损失系数。
+load_balance_coef = 0.003
 
 
 if dataset == 'clothing1m':
@@ -373,6 +513,54 @@ time_str = now.strftime('%m%d_%H%M')
 
 best_acc = 0.0
 
+# 训练开始时只记录一次实验配置。
+experiment_config = [
+    "EXPERIMENT_CONFIG_BEGIN",
+    "method=meta_mlp_expert_aggregation",
+    f"start_time={now.strftime('%Y-%m-%d_%H:%M:%S')}",
+    f"log_file={log_file_path}",
+    f"device={device}",
+    f"dataset={dataset}",
+    f"use_dirichlet={use_dirichlet}",
+    f"dirichlet_alpha={dirichlet_alpha}",
+    f"num_clients={num_clients}",
+    f"clients_per_round={num_clients}",
+    f"num_selected_arg={num_selected}",
+    f"batch_size={batch_size}",
+    f"num_epochs={num_epochs}",
+    f"num_batches={num_batches}",
+    f"num_rounds={num_rounds}",
+    f"meta_batch_size={meta_bs}",
+    f"meta_sample_number={meta_sample_number}",
+    f"model={global_model.__class__.__name__}",
+    f"num_experts={num_experts}",
+    "routing=top1",
+    "expert_aggregation=meta_mlp_client_weighting",
+    "nonexpert_aggregation=fedavg_equal_weight",
+    "meta_input=client_cross_entropy_loss,expert_activation_frequency",
+    "client_loss_for_meta=cross_entropy_only",
+    "client_training_loss=cross_entropy+load_balance",
+    "meta_loss=cross_entropy_only",
+    f"lr_max={lr}",
+    f"lr_min={min_lr}",
+    "lr_scheduler=cosine_annealing",
+    f"momentum={momentum}",
+    f"nesterov={nesterov}",
+    f"weight_decay={weight_decay}",
+    f"load_balance_coef={load_balance_coef}",
+    f"meta_hidden_size={meta_net_hidden_size}",
+    f"meta_num_layers={meta_net_num_layers}",
+    f"meta_optimizer=Adam",
+    f"meta_lr={meta_lr}",
+    f"meta_weight_decay={meta_weight_decay}",
+    "EXPERIMENT_CONFIG_END",
+]
+
+print(
+    "\n".join(experiment_config),
+    flush=True
+)
+
 fedavg_weight = torch.full(
     (num_clients,),
     1.0 / num_clients,
@@ -422,6 +610,7 @@ for round in range(num_rounds):
 
         (
             loss,
+            _load_balance_loss,
             expert_activation_frequency,
             weight_updates
         ) = client_train_1(
@@ -434,7 +623,10 @@ for round in range(num_rounds):
         )
 
         grads_list.append(weight_updates)
+
+        # 元网络输入仍然是纯交叉熵 loss。
         client_losses.append(loss.item())
+
         client_expert_frequencies.append(
             expert_activation_frequency
         )
@@ -502,21 +694,6 @@ for round in range(num_rounds):
         ).clamp_min(1e-12)
     )
 
-    print(
-        "raw_expert_weights:",
-        raw_expert_weights
-    )
-
-    print(
-        "expert_weights:",
-        expert_weights
-    )
-
-    print(
-        "expert_weight_sums:",
-        expert_weights.sum(dim=0)
-    )
-
     # 逐条记录元网络两个输入及对应输出权重。
     # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
     log_client_losses = (
@@ -567,8 +744,7 @@ for round in range(num_rounds):
         flush=True
     )
 
-    avg_client_loss = client_losses_tensor.mean().item()        
-
+    avg_client_loss = client_losses_tensor.mean().item()
 
 
     # 聚合客户端梯度
@@ -672,88 +848,11 @@ for round in range(num_rounds):
 
     meta_optimizer.step()
 
-    print(
-        'meta_loss: ',
-        meta_loss
-    )
-
-    print(
-        'meta_net.output_layer.weight after: ',
-        meta_net.output_layer.weight[:, 0:5]
-    )
-
     # 两种模式都更新全局模型
     global_model.load_state_dict(
         pseudo_net.state_dict()
     )
 
-
-    test_train_losses = torch.arange(
-        num_clients,
-        dtype=torch.float32
-    ).to(device)
-
-    print(
-        "test_train_losses: ",
-        test_train_losses
-    )
-
-    test_train_losses = torch.reshape(
-        test_train_losses,
-        (len(test_train_losses), 1)
-    )
-
-    test_loss_features = (
-        test_train_losses
-        .unsqueeze(1)
-        .expand(
-            -1,
-            num_experts,
-            -1
-        )
-    )
-
-    test_frequency_features = (
-        client_expert_frequencies_tensor
-        .unsqueeze(-1)
-    )
-
-    test_client_expert_features = torch.cat(
-        [
-            test_loss_features,
-            test_frequency_features
-        ],
-        dim=2
-    )
-
-    with torch.no_grad():
-        test_raw_expert_weights = meta_net(
-            test_client_expert_features.reshape(
-                -1,
-                2
-            )
-        ).view(
-            num_clients,
-            num_experts
-        )
-
-        test_expert_weights = (
-            test_raw_expert_weights
-            / test_raw_expert_weights.sum(
-                dim=0,
-                keepdim=True
-            ).clamp_min(1e-12)
-        )
-
-    print(
-        'test_expert_weights:',
-        test_expert_weights
-    )
-
-    print(
-        'test_expert_weight_sums:',
-        test_expert_weights.sum(dim=0)
-    )
 
     test_loss, test_accuracy = test_model(
         global_model,
@@ -773,24 +872,24 @@ for round in range(num_rounds):
     )
 
 
-    torch.save(
-        meta_net.state_dict(),
-        (
-            f'./save/mlp_model_s_LN'
-            f'{num_selected}_N{num_clients}_'
-            f'BS{batch_size}_{dataset}_'
-            f'{time_str}.pth'
-        )
-    )
+    # torch.save(
+    #     meta_net.state_dict(),
+    #     (
+    #         f'./save/mlp_model_s_LN'
+    #         f'{num_selected}_N{num_clients}_'
+    #         f'BS{batch_size}_{dataset}_'
+    #         f'{time_str}.pth'
+    #     )
+    # )
 
-    # 两种模式都保存全局模型
-    torch.save(
-        global_model.state_dict(),
-        (
-            f'./save/expert_mlp_nonexpert_fedavg_'
-            f'global_model_s_LN'
-            f'{num_selected}_N{num_clients}_'
-            f'BS{batch_size}_{dataset}_'
-            f'{time_str}.pth'
-        )
-    )
+    # # 两种模式都保存全局模型
+    # torch.save(
+    #     global_model.state_dict(),
+    #     (
+    #         f'./save/expert_mlp_nonexpert_fedavg_'
+    #         f'global_model_s_LN'
+    #         f'{num_selected}_N{num_clients}_'
+    #         f'BS{batch_size}_{dataset}_'
+    #         f'{time_str}.pth'
+    #     )
+    # )
