@@ -311,10 +311,10 @@ class MetaMLPExpert(MetaModule):
 
 class MetaMoEHead(MetaModule):
     """
-    Top-1 稀疏 MoE。
+    Top-2 稀疏 MoE。
 
-    Gate 为每个样本选择一个专家，
-    只执行被选中的专家。
+    Gate 为每个样本选择两个专家，只执行被选中的专家。
+    两个专家的输出按照选中后的 Gate 概率重新归一化并加权求和。
     """
 
     def __init__(
@@ -322,12 +322,25 @@ class MetaMoEHead(MetaModule):
         input_dim,
         num_classes,
         num_experts=4,
-        expert_hidden_dim=128
+        expert_hidden_dim=128,
+        top_k=2
     ):
         super(MetaMoEHead, self).__init__()
 
+        if top_k < 1:
+            raise ValueError(
+                f'top_k must be at least 1, got {top_k}.'
+            )
+
+        if top_k > num_experts:
+            raise ValueError(
+                f'top_k={top_k} cannot exceed '
+                f'num_experts={num_experts}.'
+            )
+
         self.num_experts = num_experts
         self.num_classes = num_classes
+        self.top_k = top_k
 
         self.experts = nn.ModuleList([
             MetaMLPExpert(
@@ -344,7 +357,13 @@ class MetaMoEHead(MetaModule):
         )
 
         self.last_gate_weights = None
+
+        # Top-2 专家索引，shape: [batch_size, top_k]。
+        self.last_selected_experts = None
+
+        # 保留旧字段作为兼容别名，表示概率最大的第一个专家。
         self.last_selected_expert = None
+
         self.last_load_balance_loss = None
 
     def forward(self, x):
@@ -358,25 +377,47 @@ class MetaMoEHead(MetaModule):
             dim=1
         )
 
-        # 每个样本选择一个专家
-        selected_expert = torch.argmax(
+        # 每个样本选择概率最大的 top_k 个专家。
+        # topk_probs / selected_experts:
+        # [B, top_k]
+        topk_probs, selected_experts = torch.topk(
             gate_probs,
+            k=self.top_k,
             dim=1
         )
 
-        hard_gate = F.one_hot(
-            selected_expert,
-            num_classes=self.num_experts
-        ).to(
-            dtype=x.dtype,
-            device=x.device
+        # 只在被选中的专家之间重新归一化，
+        # 保证每个样本的 Top-2 权重之和为 1。
+        topk_weights = (
+            topk_probs
+            / topk_probs.sum(
+                dim=1,
+                keepdim=True
+            ).clamp_min(1e-12)
         )
 
-        # Top-1 MoE 负载均衡辅助损失。
-        # expert_fraction 是当前 batch 的实际专家分配比例；
-        # router_probability 是可微的平均路由概率。
+        # hard_gate[b, e] = 1 表示样本 b 的 Top-2
+        # 路由结果中包含专家 e。
+        hard_gate = torch.zeros_like(
+            gate_probs
+        )
+
+        hard_gate.scatter_(
+            dim=1,
+            index=selected_experts,
+            value=1.0
+        )
+
+        # Top-2 MoE 负载均衡辅助损失。
+        #
+        # 每个样本产生 top_k 次路由，因此除以 B * top_k，
+        # 使所有专家的实际分配比例之和仍然等于 1。
         expert_fraction = (
-            hard_gate.detach().mean(dim=0)
+            hard_gate.detach().sum(dim=0)
+            / (
+                batch_size
+                * self.top_k
+            )
         )
 
         router_probability = (
@@ -391,28 +432,31 @@ class MetaMoEHead(MetaModule):
             )
         )
 
-        # 前向为硬选择，反向通过 softmax 概率训练 Gate
-        gate_weights = (
-            hard_gate
-            - gate_probs.detach()
-            + gate_probs
-        )
-
         output = x.new_zeros(
             batch_size,
             self.num_classes
         )
 
+        # 只执行当前 batch 中实际被 Top-2 选中的专家。
         for expert_id, expert in enumerate(
             self.experts
         ):
-            sample_indices = torch.nonzero(
-                selected_expert == expert_id,
+            # 每一行是 [sample_index, topk_rank]。
+            selected_positions = torch.nonzero(
+                selected_experts == expert_id,
                 as_tuple=False
-            ).squeeze(1)
+            )
 
-            if sample_indices.numel() == 0:
+            if selected_positions.numel() == 0:
                 continue
+
+            sample_indices = (
+                selected_positions[:, 0]
+            )
+
+            topk_rank_indices = (
+                selected_positions[:, 1]
+            )
 
             expert_inputs = x.index_select(
                 0,
@@ -423,14 +467,25 @@ class MetaMoEHead(MetaModule):
                 expert_inputs
             )
 
-            selected_weights = gate_weights.index_select(
-                0,
-                sample_indices
-            )[:, expert_id].unsqueeze(1)
+            selected_weights = topk_weights[
+                sample_indices,
+                topk_rank_indices
+            ].unsqueeze(1)
 
+            # 前向仍按 Gate 权重加权：
+            #     forward = expert_outputs * selected_weights
+            #
+            # 专家参数反向梯度不乘 Gate 权重：
+            #     d(weighted_outputs) / d(expert_outputs) = 1
+            #
+            # Gate 仍可通过 selected_weights 接收分类损失梯度。
             weighted_outputs = (
                 expert_outputs
-                * selected_weights
+                + expert_outputs.detach()
+                * (
+                    selected_weights
+                    - 1.0
+                )
             )
 
             output = output.index_add(
@@ -443,9 +498,15 @@ class MetaMoEHead(MetaModule):
             gate_probs.detach()
         )
 
-        self.last_selected_expert = (
-            selected_expert.detach()
+        self.last_selected_experts = (
+            selected_experts.detach()
         )
+
+        # 兼容仍读取旧字段的代码。
+        self.last_selected_expert = (
+            selected_experts[:, 0].detach()
+        )
+
         return output
 
 

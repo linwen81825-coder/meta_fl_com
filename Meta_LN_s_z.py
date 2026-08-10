@@ -379,7 +379,7 @@ os.makedirs(
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_'
+    f'./log2/Meta_LN_s_z'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -544,7 +544,8 @@ experiment_config = [
     "top2_output=renormalized_gate_weighted_sum",
     "expert_aggregation=meta_mlp_client_weighting",
     "nonexpert_aggregation=fedavg_equal_weight",
-    "meta_input=client_cross_entropy_loss,expert_activation_frequency",
+    "meta_input=standardized_client_cross_entropy_loss,expert_activation_frequency",
+    "loss_standardization=zscore_per_round_across_clients",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
     "meta_loss=cross_entropy_only",
@@ -651,11 +652,22 @@ for round in range(num_rounds):
     ).to(device)
     # [num_clients, num_experts]
 
-    # 不对 loss 做标准化。
+    # 对当前轮所有客户端的交叉熵 loss 做 Z-score 标准化。
+    # 标准化只用于元网络输入，不改变客户端训练 loss、
+    # 梯度计算、日志中的原始 client_loss 或其他训练流程。
+    loss_mean = client_losses_tensor.mean()
+    loss_std = client_losses_tensor.std(
+        unbiased=False
+    ).clamp_min(1e-12)
+
+    standardized_client_losses_tensor = (
+        client_losses_tensor - loss_mean
+    ) / loss_std
+
     # 对客户端 k、专家 e 构造：
-    # [client_loss_k, activation_frequency_k_e]
+    # [standardized_client_loss_k, activation_frequency_k_e]
     loss_features = (
-        client_losses_tensor
+        standardized_client_losses_tensor
         .unsqueeze(1)
         .expand(
             -1,

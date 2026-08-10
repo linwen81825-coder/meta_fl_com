@@ -465,12 +465,12 @@ log_time_str = log_start_time.strftime(
 )
 
 os.makedirs(
-    './log1',
+    './log2',
     exist_ok=True
 )
 
 log_file_path = (
-    f'./log1/FedAvg_LN_s_'
+    f'./log2/FedAvg_LN_s_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -508,8 +508,8 @@ nesterov = True
 momentum = 0.9
 weight_decay = 5e-4
 
-# Top-1 MoE 负载均衡辅助损失系数。
-load_balance_coef = 0.003
+# Top-2 MoE 负载均衡辅助损失系数。
+load_balance_coef = 0.01
 
 if dataset == 'clothing1m':
     (
@@ -591,7 +591,9 @@ experiment_config = [
     f"meta_sample_number={meta_sample_number}",
     f"model={global_model.__class__.__name__}",
     f"num_experts={num_experts}",
-    "routing=top1",
+    "routing=top2",
+    "top_k=2",
+    "top2_output=renormalized_gate_weighted_sum",
     "aggregation=equal_average_full_client_updates",
     "client_training_loss=cross_entropy+load_balance",
     "client_loss_log=cross_entropy_only",

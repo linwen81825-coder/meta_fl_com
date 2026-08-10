@@ -274,7 +274,7 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
             device=device,
             dtype=torch.float32
         )
-        / data.size(0)
+        / selected_experts.numel()
     )
 
     # 元网络输入仍然只使用交叉熵损失。
@@ -379,7 +379,7 @@ os.makedirs(
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_'
+    f'./log2/Meta_LN_s_loss_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -487,7 +487,7 @@ client_model = build_model(dataset).to(device)
 
 # 初始化元学习网络
 meta_net = MLP(
-    input_size=2,
+    input_size=1,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
     output_size=1
@@ -544,7 +544,12 @@ experiment_config = [
     "top2_output=renormalized_gate_weighted_sum",
     "expert_aggregation=meta_mlp_client_weighting",
     "nonexpert_aggregation=fedavg_equal_weight",
-    "meta_input=client_cross_entropy_loss,expert_activation_frequency",
+    "meta_input=client_cross_entropy_loss",
+    "meta_input_size=1",
+    "meta_output_size=1",
+    "meta_output=shared_loss_to_weight_mapping",
+    "expert_weight_rule=shared_across_experts",
+    "expert_activation_frequency_used_by_meta=false",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
     "meta_loss=cross_entropy_only",
@@ -631,7 +636,7 @@ for round in range(num_rounds):
 
         grads_list.append(weight_updates)
 
-        # 元网络输入仍然是纯交叉熵 loss。
+        # 元网络唯一输入是纯交叉熵 loss。
         client_losses.append(loss.item())
 
         client_expert_frequencies.append(
@@ -652,44 +657,25 @@ for round in range(num_rounds):
     # [num_clients, num_experts]
 
     # 不对 loss 做标准化。
-    # 对客户端 k、专家 e 构造：
-    # [client_loss_k, activation_frequency_k_e]
-    loss_features = (
+    # 元网络输入只有客户端交叉熵 loss：
+    # [client_loss_k]
+    #
+    # 所有专家共享同一条 loss -> weight 映射规则。
+    # 同一个客户端先得到一个 raw_client_weight，
+    # 然后该权重用于该客户端的所有专家。
+    raw_client_weights = meta_net(
         client_losses_tensor
-        .unsqueeze(1)
-        .expand(
-            -1,
-            num_experts,
-            -1
-        )
-    )
-    # [num_clients, num_experts, 1]
-
-    frequency_features = (
-        client_expert_frequencies_tensor
-        .unsqueeze(-1)
-    )
-    # [num_clients, num_experts, 1]
-
-    client_expert_features = torch.cat(
-        [
-            loss_features,
-            frequency_features
-        ],
-        dim=2
-    )
-    # [num_clients, num_experts, 2]
-
-    # 每个客户端-专家对输出一个客户端聚合权重分数。
-    raw_expert_weights = meta_net(
-        client_expert_features.reshape(
-            -1,
-            2
-        )
     ).view(
         num_clients,
+        1
+    )
+    # [num_clients, 1]
+
+    raw_expert_weights = raw_client_weights.expand(
+        -1,
         num_experts
     )
+    # [num_clients, num_experts]
 
     # 每个专家分别沿客户端维度归一化。
     # expert_weights[:, expert_id].sum() == 1
@@ -701,7 +687,10 @@ for round in range(num_rounds):
         ).clamp_min(1e-12)
     )
 
-    # 逐条记录元网络两个输入及对应输出权重。
+    # 逐条记录元网络输入、Top-2 激活频率统计及输出权重。
+    # activation_frequency 仅用于日志，不作为元网络输入。
+    # 所有专家共享同一条 loss -> weight 映射规则，
+    # 因此同一客户端在不同专家上的 raw_weight 相同。
     # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
     log_client_losses = (
         client_losses_tensor
