@@ -42,6 +42,10 @@ class RoundOnlyConsoleLogger:
         self._closed = False
 
     @property
+    def closed(self):
+        return self._closed
+
+    @property
     def encoding(self):
         return getattr(
             self.console_stream,
@@ -58,11 +62,13 @@ class RoundOnlyConsoleLogger:
     def write(self, text):
         if self._closed:
             return 0
+
         if not isinstance(text, str):
             text = str(text)
 
         # 完整内容始终写入日志。
-        self.log_stream.write(text)
+        if not self.log_stream.closed:
+            self.log_stream.write(text)
 
         # 控制台只输出每轮汇总行。
         self.pending_text += text
@@ -81,7 +87,7 @@ class RoundOnlyConsoleLogger:
         return len(text)
 
     def flush(self):
-        # 程序退出时，flush 可能在文件关闭后再次被调用
+        # 解释器退出时可能在 close() 后再次调用 flush()。
         if not self.log_stream.closed:
             self.log_stream.flush()
 
@@ -91,7 +97,7 @@ class RoundOnlyConsoleLogger:
             pass
 
     def close(self):
-        # 避免重复关闭
+        # 允许 atexit 和解释器清理阶段重复调用。
         if self._closed:
             return
 

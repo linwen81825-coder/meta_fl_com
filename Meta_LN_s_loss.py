@@ -546,9 +546,6 @@ experiment_config = [
     "nonexpert_aggregation=fedavg_equal_weight",
     "meta_input=client_cross_entropy_loss",
     "meta_input_size=1",
-    "meta_output_size=1",
-    "meta_output=shared_loss_to_weight_mapping",
-    "expert_weight_rule=shared_across_experts",
     "expert_activation_frequency_used_by_meta=false",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
@@ -660,20 +657,20 @@ for round in range(num_rounds):
     # 元网络输入只有客户端交叉熵 loss：
     # [client_loss_k]
     #
-    # 所有专家共享同一条 loss -> weight 映射规则。
-    # 同一个客户端先得到一个 raw_client_weight，
-    # 然后该权重用于该客户端的所有专家。
+    # 因为输入中没有专家激活频率或 expert_id，
+    # 同一客户端对所有专家产生相同的原始权重。
     raw_client_weights = meta_net(
         client_losses_tensor
     ).view(
         num_clients,
         1
     )
-    # [num_clients, 1]
 
-    raw_expert_weights = raw_client_weights.expand(
-        -1,
-        num_experts
+    raw_expert_weights = (
+        raw_client_weights.expand(
+            -1,
+            num_experts
+        )
     )
     # [num_clients, num_experts]
 
@@ -689,8 +686,6 @@ for round in range(num_rounds):
 
     # 逐条记录元网络输入、Top-2 激活频率统计及输出权重。
     # activation_frequency 仅用于日志，不作为元网络输入。
-    # 所有专家共享同一条 loss -> weight 映射规则，
-    # 因此同一客户端在不同专家上的 raw_weight 相同。
     # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
     log_client_losses = (
         client_losses_tensor
