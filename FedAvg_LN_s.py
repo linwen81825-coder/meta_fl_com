@@ -262,6 +262,67 @@ def client_train(
             )
 
             training_loss.backward()
+
+            # 只对专家参数按“实际路由到该专家的样本数”做内部平均。
+            #
+            # 当前专家反向不乘 Gate 权重，CrossEntropyLoss 又是
+            # 对整个 batch 取 mean，因此专家 e 的梯度原本为：
+            #
+            #     g_e = (1 / B) * sum_{i routed to e} g_i
+            #
+            # 乘 B / n_e 后变成该专家实际路由样本的平均梯度：
+            #
+            #     g_e_mean = (1 / n_e) * sum_{i routed to e} g_i
+            #
+            # backbone、BN、Gate 等非专家参数完全不改。
+            selected_experts = (
+                model.fc.last_selected_experts
+            )
+
+            if selected_experts is None:
+                raise RuntimeError(
+                    'model.fc.last_selected_experts is None.'
+                )
+
+            expert_routed_counts = torch.bincount(
+                selected_experts.reshape(-1),
+                minlength=model.fc.num_experts
+            ).to(
+                device=device,
+                dtype=torch.float32
+            )
+
+            batch_sample_count = float(
+                data.size(0)
+            )
+
+            for param_name, param in (
+                model.named_parameters()
+            ):
+                if not param_name.startswith(
+                    'fc.experts.'
+                ):
+                    continue
+
+                if param.grad is None:
+                    continue
+
+                expert_id = int(
+                    param_name.split('.')[2]
+                )
+
+                routed_count = (
+                    expert_routed_counts[expert_id]
+                )
+
+                if routed_count.item() > 0:
+                    param.grad.mul_(
+                        batch_sample_count
+                        / routed_count
+                    )
+                else:
+                    param.grad.zero_()
+
             optimizer.step()
 
             # Client Loss 仍然记录纯交叉熵。
@@ -508,8 +569,8 @@ num_batches = 1
 meta_bs = 128
 meta_sample_number = 1000
 
-lr = 0.03
-min_lr = 0.001
+lr = 0.02
+min_lr = 0.0001
 nesterov = True
 momentum = 0.9
 weight_decay = 5e-4

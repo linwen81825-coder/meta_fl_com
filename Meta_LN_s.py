@@ -320,6 +320,69 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
         )
     )
 
+    # 只对专家参数按“实际路由到该专家的样本数”做内部平均。
+    #
+    # CrossEntropyLoss 默认对整个 batch 取 mean。
+    # 当前专家反向不再乘 Gate 权重，因此专家 e 的原始梯度为：
+    #
+    #     g_e = (1 / B) * sum_{i routed to e} g_i
+    #
+    # 令 n_e 为当前 batch 中实际路由到专家 e 的样本数，
+    # 对专家参数梯度乘 B / n_e 后得到：
+    #
+    #     g_e_mean = (1 / n_e) * sum_{i routed to e} g_i
+    #
+    # backbone、BN、Gate 等非专家参数完全不改。
+    expert_routed_counts = torch.bincount(
+        selected_experts.reshape(-1),
+        minlength=model.fc.num_experts
+    ).to(
+        device=device,
+        dtype=torch.float32
+    )
+
+    model_param_names = [
+        name
+        for name, _ in model.named_params(model)
+    ]
+
+    if len(model_param_names) != len(pseudo_grads):
+        raise RuntimeError(
+            '参数名称数量与客户端梯度数量不一致'
+        )
+
+    routed_mean_pseudo_grads = []
+    batch_sample_count = float(data.size(0))
+
+    for param_name, grad in zip(
+        model_param_names,
+        pseudo_grads
+    ):
+        if param_name.startswith('fc.experts.'):
+            expert_id = int(
+                param_name.split('.')[2]
+            )
+
+            routed_count = (
+                expert_routed_counts[expert_id]
+            )
+
+            if routed_count.item() > 0:
+                grad = grad * (
+                    batch_sample_count
+                    / routed_count
+                )
+            else:
+                grad = torch.zeros_like(grad)
+
+        routed_mean_pseudo_grads.append(
+            grad
+        )
+
+    pseudo_grads = tuple(
+        routed_mean_pseudo_grads
+    )
+
     return (
         cross_entropy_loss.detach(),
         load_balance_loss.detach(),
@@ -421,7 +484,7 @@ meta_sample_number = 1000
 
 # FL model parameters
 lr = 0.03
-min_lr = 0.001
+min_lr = 0.0005
 decay_factor = 0.996
 
 # Meta model parameters
