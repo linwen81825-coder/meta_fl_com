@@ -731,3 +731,820 @@ class VNet(MetaModule):
         x = self.relu(x)
         out = self.linear2(x)
         return F.sigmoid(out)
+class ResNet10Lite(MetaModule):
+    """
+    适合 CIFAR10 + Label Noise 的轻量 ResNet backbone
+
+    结构:
+        Conv3x3
+        Layer1: 32
+        Layer2: 64
+        Layer3: 128
+        GAP
+        MetaMoEHead
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+        super(ResNet10Lite, self).__init__()
+
+        self.in_planes = 32
+
+
+        # CIFAR 输入
+        self.conv1 = MetaConv2d(
+            3,
+            32,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+        self.bn1 = MetaBatchNorm2d(32)
+
+
+        # 三个 residual stage
+        self.layer1 = self._make_layer(
+            MetaBasicBlock,
+            32,
+            blocks=1,
+            stride=1
+        )
+
+
+        self.layer2 = self._make_layer(
+            MetaBasicBlock,
+            64,
+            blocks=1,
+            stride=2
+        )
+
+
+        self.layer3 = self._make_layer(
+            MetaBasicBlock,
+            128,
+            blocks=1,
+            stride=2
+        )
+
+
+        self.feature_dim = 128
+
+
+        # 保持你的 MoE head 接口
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def _make_layer(
+        self,
+        block,
+        planes,
+        blocks,
+        stride
+    ):
+
+        layers = []
+
+        strides = [stride] + [1] * (blocks-1)
+
+        for s in strides:
+
+            layers.append(
+                block(
+                    self.in_planes,
+                    planes,
+                    s
+                )
+            )
+
+            self.in_planes = planes
+
+
+        return nn.Sequential(*layers)
+
+
+
+    def forward(self,x):
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
+
+        x = self.layer1(x)
+
+        x = self.layer2(x)
+
+        x = self.layer3(x)
+
+
+        # CIFAR global pooling
+        x = F.adaptive_avg_pool2d(
+            x,
+            1
+        )
+
+
+        x = torch.flatten(
+            x,
+            1
+        )
+
+
+        x = self.fc(x)
+
+
+        return x
+
+class ResNet20Lite(MetaModule):
+
+    """
+    CIFAR10 ResNet20 backbone
+
+    Conv
+    Stage1: 3 blocks
+    Stage2: 3 blocks
+    Stage3: 3 blocks
+
+    Feature:
+        256 dim
+
+    MoE Head:
+        unchanged
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+        super(ResNet20Lite, self).__init__()
+
+        self.in_planes = 16
+
+
+        self.conv1 = MetaConv2d(
+            3,
+            16,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+        self.bn1 = MetaBatchNorm2d(16)
+
+
+
+        self.layer1 = self._make_layer(
+            MetaBasicBlock,
+            16,
+            blocks=3,
+            stride=1
+        )
+
+
+        self.layer2 = self._make_layer(
+            MetaBasicBlock,
+            32,
+            blocks=3,
+            stride=2
+        )
+
+
+        self.layer3 = self._make_layer(
+            MetaBasicBlock,
+            64,
+            blocks=3,
+            stride=2
+        )
+
+
+        # 提升feature维度
+        self.feature_expand = MetaConv2d(
+            64,
+            256,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False
+        )
+
+        self.bn_last = MetaBatchNorm2d(256)
+
+
+
+        self.feature_dim = 256
+
+
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+    def _make_layer(
+        self,
+        block,
+        planes,
+        blocks,
+        stride
+    ):
+
+        layers=[]
+
+        strides=[
+            stride
+        ] + [
+            1
+        ]*(blocks-1)
+
+
+        for s in strides:
+
+            layers.append(
+                block(
+                    self.in_planes,
+                    planes,
+                    s
+                )
+            )
+
+            self.in_planes = planes
+
+
+        return nn.Sequential(*layers)
+
+
+
+    def forward(self,x):
+
+        x=self.conv1(x)
+        x=self.bn1(x)
+        x=F.relu(x)
+
+
+        x=self.layer1(x)
+
+        x=self.layer2(x)
+
+        x=self.layer3(x)
+
+
+        x=self.feature_expand(x)
+
+        x=self.bn_last(x)
+
+        x=F.relu(x)
+
+
+
+        x=F.adaptive_avg_pool2d(
+            x,
+            1
+        )
+
+
+        x=torch.flatten(
+            x,
+            1
+        )
+
+
+        x=self.fc(x)
+
+        return x
+class MetaResBlock(MetaModule):
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels
+    ):
+        super(MetaResBlock,self).__init__()
+
+
+        self.bn1 = MetaBatchNorm2d(
+            in_channels
+        )
+
+        self.conv1 = MetaConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+        self.bn2 = MetaBatchNorm2d(
+            out_channels
+        )
+
+        self.conv2 = MetaConv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+        if in_channels != out_channels:
+
+            self.shortcut = MetaConv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            )
+
+        else:
+
+            self.shortcut = None
+
+
+
+    def forward(self,x):
+
+        identity=x
+
+
+        out=F.relu(
+            self.bn1(x)
+        )
+
+        out=self.conv1(out)
+
+
+        out=F.relu(
+            self.bn2(out)
+        )
+
+        out=self.conv2(out)
+
+
+        if self.shortcut is not None:
+
+            identity=self.shortcut(identity)
+
+
+        out = out + identity
+
+
+        return out
+class MetaResNetConvNet(MetaModule):
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            MetaResNetConvNet,
+            self
+        ).__init__()
+
+
+
+        self.conv1 = MetaConv2d(
+            3,
+            16,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+        self.bn1 = MetaBatchNorm2d(
+            16
+        )
+
+
+        self.block1 = MetaResBlock(
+            16,
+            16
+        )
+
+
+        self.block2 = MetaResBlock(
+            16,
+            32
+        )
+
+
+        self.block3 = MetaResBlock(
+            32,
+            64
+        )
+
+
+        self.feature_dim = 64*4*4
+
+
+
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def forward(self,x):
+
+
+        x=F.relu(
+            self.bn1(
+                self.conv1(x)
+            )
+        )
+
+
+        x=self.block1(x)
+
+        x=F.max_pool2d(
+            x,
+            2
+        )
+
+
+        x=self.block2(x)
+
+        x=F.max_pool2d(
+            x,
+            2
+        )
+
+
+        x=self.block3(x)
+
+        x=F.max_pool2d(
+            x,
+            2
+        )
+
+
+        x=x.view(
+            x.size(0),
+            -1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x
+class MetaDepthwiseConv2d(MetaModule):
+
+    def __init__(
+        self,
+        channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=False
+    ):
+        super().__init__()
+
+        conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size,
+            stride,
+            padding,
+            groups=channels,
+            bias=bias
+        )
+
+
+        self.in_channels = channels
+        self.out_channels = channels
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.groups = channels
+        self.kernel_size = conv.kernel_size
+
+
+        self.register_buffer(
+            'weight',
+            to_var(
+                conv.weight.data,
+                requires_grad=True
+            )
+        )
+
+
+        if bias:
+            self.register_buffer(
+                'bias',
+                to_var(
+                    conv.bias.data,
+                    requires_grad=True
+                )
+            )
+
+        else:
+            self.register_buffer(
+                'bias',
+                None
+            )
+
+
+    def forward(self,x):
+
+        return F.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            groups=self.groups
+        )
+
+
+    def named_leaves(self):
+
+        return [
+            ('weight',self.weight),
+            ('bias',self.bias)
+        ]
+class MetaInvertedResidual(MetaModule):
+
+    def __init__(
+        self,
+        inp,
+        oup,
+        stride,
+        expand_ratio=4
+    ):
+
+        super().__init__()
+
+
+        hidden_dim = inp * expand_ratio
+
+
+        self.use_res_connect = (
+            stride == 1
+            and inp == oup
+        )
+
+
+        layers=[]
+
+
+        # expansion
+        if expand_ratio != 1:
+
+            layers.extend([
+
+                MetaConv2d(
+                    inp,
+                    hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False
+                ),
+
+                MetaBatchNorm2d(
+                    hidden_dim
+                ),
+
+                nn.ReLU6(inplace=True)
+
+            ])
+
+
+
+        # depthwise
+
+        layers.extend([
+
+            MetaDepthwiseConv2d(
+                hidden_dim,
+                kernel_size=3,
+                stride=stride,
+                padding=1
+            ),
+
+            MetaBatchNorm2d(
+                hidden_dim
+            ),
+
+            nn.ReLU6(inplace=True)
+
+
+        ])
+
+
+
+        # projection
+
+        layers.extend([
+
+            MetaConv2d(
+                hidden_dim,
+                oup,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                oup
+            )
+
+        ])
+
+
+        self.conv = nn.Sequential(
+            *layers
+        )
+
+
+
+    def forward(self,x):
+
+        out=self.conv(x)
+
+
+        if self.use_res_connect:
+
+            return x+out
+
+        else:
+
+            return out
+class MetaMobileNetV2Lite(MetaModule):
+
+
+    """
+    CIFAR10/CINIC10
+
+    Lightweight MobileNetV2 backbone
+
+    Conv
+    MBConv
+    MBConv
+    MBConv
+
+    GAP
+
+    MetaMoEHead
+    """
+
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super().__init__()
+
+
+
+        self.conv1 = nn.Sequential(
+
+            MetaConv2d(
+                3,
+                32,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                32
+            ),
+
+            nn.ReLU6(inplace=True)
+
+        )
+
+
+
+        self.layer1 = MetaInvertedResidual(
+            32,
+            64,
+            stride=1,
+            expand_ratio=4
+        )
+
+
+
+        self.layer2 = nn.Sequential(
+
+            MetaInvertedResidual(
+                64,
+                128,
+                stride=2,
+                expand_ratio=4
+            ),
+
+            MetaInvertedResidual(
+                128,
+                128,
+                stride=1,
+                expand_ratio=4
+            )
+
+        )
+
+
+
+        self.layer3 = nn.Sequential(
+
+            MetaInvertedResidual(
+                128,
+                256,
+                stride=2,
+                expand_ratio=4
+            ),
+
+            MetaInvertedResidual(
+                256,
+                256,
+                stride=1,
+                expand_ratio=4
+            )
+
+        )
+
+
+        self.feature_dim=256
+
+
+
+        self.fc=MetaMoEHead(
+
+            input_dim=self.feature_dim,
+
+            num_classes=num_classes,
+
+            num_experts=num_experts,
+
+            expert_hidden_dim=expert_hidden_dim
+
+        )
+
+
+
+    def forward(self,x):
+
+
+        x=self.conv1(x)
+
+
+        x=self.layer1(x)
+
+
+        x=self.layer2(x)
+
+
+        x=self.layer3(x)
+
+
+
+        x=F.adaptive_avg_pool2d(
+            x,
+            1
+        )
+
+
+        x=torch.flatten(
+            x,
+            1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x

@@ -1,8 +1,12 @@
+import copy
+
 import torch
 import torch.nn as nn
 from dataset.dataSplit_LN_new import get_data_loaders_new
 from model.model import MLP
-from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18
+from model.wideresnet import SmallMetaConvNet
+from model.resnet18_half_moe import ResNet18HalfMoE
+from model.shallow_resnet3_moe import ShallowResNet3MoE
 import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
@@ -96,10 +100,66 @@ class RoundOnlyConsoleLogger:
 
         self._closed = True
 
+# def build_model(dataset):
+#     if dataset == 'cifar10':
+#         model = SmallMetaConvNetWide48(
+#             num_classes=10,
+#             num_experts=4,
+#             expert_hidden_dim=128,
+#             top_k=2
+#         )
 
+#     elif dataset == 'cifar100':
+#         model = ShallowResNet5MoE(
+#             num_classes=100,
+#             num_experts=4,
+#             expert_hidden_dim=128,
+#             top_k=2
+#         )
 
-# def build_model(dataset, layers=10, widen_factor=2, droprate=0):
-def build_model(dataset):
+#     else:
+#         raise ValueError(
+#             f"Unsupported dataset: {dataset}"
+#         )
+
+#     if torch.cuda.is_available():
+#         model.cuda()
+#         torch.backends.cudnn.benchmark = True
+
+#     return model
+# def build_model(dataset):
+#     if dataset == 'cifar10':
+#         model = WideResNetMoE(
+#             depth=16,
+#             num_classes=10,
+#             widen_factor=2,
+#             dropRate=0.0,
+#             num_experts=4,
+#             expert_hidden_dim=128,
+#             top_k=2
+#         )
+
+#     elif dataset == 'cifar100':
+#         model = WideResNetMoE(
+#             num_classes=100,
+#             dropRate=0.0,
+#             num_experts=4,
+#             expert_hidden_dim=128,
+#             top_k=2
+#         )
+
+#     else:
+#         raise ValueError(
+#             f"Unsupported dataset: {dataset}"
+#         )
+
+#     if torch.cuda.is_available():
+#         model.cuda()
+#         torch.backends.cudnn.benchmark = True
+
+#     return model
+
+# def build_model(dataset):
 #     if dataset == 'cifar10':
 #         model = ResNet18(num_classes=10)
 
@@ -118,14 +178,7 @@ def build_model(dataset):
 
 #     return model
 
-    # model = ResNet32(args.dataset == 'cifar10' and 10 or 100)
-    # model = WideResNet(
-    #     layers,
-    #     dataset == 'cifar10' and 10 or 100,
-    #     widen_factor,
-    #     dropRate=droprate
-    # )
-
+def build_model(dataset):
     if dataset == 'cifar10':
         model = SmallMetaConvNet(num_classes=10)
     elif dataset == 'cifar100':
@@ -139,29 +192,6 @@ def build_model(dataset):
 
     return model
 
-
-    # if dataset == 'cifar10':
-    #     model = WideResNet(
-    #         layers,
-    #         10,
-    #         widen_factor,
-    #         dropRate=droprate
-    #     )
-    # elif dataset == 'cifar100':
-    #     model = WideResNet(
-    #         layers,
-    #         100,
-    #         widen_factor,
-    #         dropRate=droprate
-    #     )
-    # elif dataset == 'clothing1m':
-    #     model = SmallMetaConvNet1(num_classes=14)
-
-    # if torch.cuda.is_available():
-    #     model.cuda()
-    #     torch.backends.cudnn.benchmark = True
-
-    # return model
 
 
 def client_train(model, train_loader, criterion, optimizer, num_epochs, num_batches):
@@ -241,153 +271,223 @@ def test_model(model, test_loader, criterion):
     return test_loss, accuracy
 
 
-def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_batches):
+def optimizer_state_to_cpu(obj):
+    """
+    与 FedAvg_LN_s.py 保持一致：
+    将每个客户端 optimizer.state_dict() 中的张量递归保存到 CPU，
+    从而跨通信轮保留该客户端的 momentum buffer。
+    """
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+
+    if isinstance(obj, dict):
+        return {
+            key: optimizer_state_to_cpu(value)
+            for key, value in obj.items()
+        }
+
+    if isinstance(obj, list):
+        return [
+            optimizer_state_to_cpu(value)
+            for value in obj
+        ]
+
+    if isinstance(obj, tuple):
+        return tuple(
+            optimizer_state_to_cpu(value)
+            for value in obj
+        )
+
+    return copy.deepcopy(obj)
+
+
+def client_train_1(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    num_epochs,
+    num_batches,
+    global_state_cpu,
+    load_balance_coef
+):
+    """
+    Meta 版本的客户端更新与 FedAvg_LN_s.py 对齐：
+
+    1. 相同 global model 起点；
+    2. 相同 SGD / momentum / Nesterov / weight decay；
+    3. 相同 CE + load-balance 本地目标；
+    4. backward() 后按 FedAvg 中完全相同的逻辑处理 expert gradient；
+    5. 真正执行 optimizer.step()；
+    6. 返回 local_state - global_state 的完整客户端参数更新。
+
+    Meta 特有的 loss / activation_frequency 只用于服务器端元网络，
+    不改变客户端 SGD 更新本身。
+    """
     model.train()
 
-    # 只训练一个epoch和一个batch
-    data, target = next(iter(train_loader))
-    data, target = data.to(device), target.to(device)
+    train_loss = 0.0
+    trained_batches = 0
 
-    optimizer.zero_grad()
+    # 当前实验 num_epochs=1、num_batches=1。
+    # 这里仍写成和 FedAvg 一致的通用循环。
+    last_cross_entropy_loss = None
+    last_load_balance_loss = None
+    last_activation_frequency = None
 
-    output = model(data)
+    for _ in range(num_epochs):
+        for batch_idx, (data, target) in enumerate(
+            train_loader
+        ):
+            if batch_idx >= num_batches:
+                break
 
-    # Top-2 专家激活频率。
-    # last_selected_experts shape: [batch_size, top_k]
-    selected_experts = (
-        model.fc.last_selected_experts
-    )
-
-    if selected_experts is None:
-        raise RuntimeError(
-            'model.fc.last_selected_experts is None.'
-        )
-
-    # Top-2 专家激活频率按用户当前定义计算：
-    # activation_count / batch_size。
-    # 因为是 Top-2，所以所有专家频率之和为 2，而不是 1。
-    expert_activation_frequency = (
-        torch.bincount(
-            selected_experts.reshape(-1),
-            minlength=model.fc.num_experts
-        ).to(
-            device=device,
-            dtype=torch.float32
-        )
-        / data.size(0)
-    )
-
-    # 元网络输入仍然只使用交叉熵损失。
-    cross_entropy_loss = criterion(
-        output,
-        target
-    )
-
-    load_balance_loss = (
-        model.fc.last_load_balance_loss
-    )
-
-    if load_balance_loss is None:
-        raise RuntimeError(
-            'model.fc.last_load_balance_loss is None.'
-        )
-
-    # 负载均衡损失只参与模型梯度，
-    # 不作为元网络输入，也不加入 meta_loss。
-    training_loss = (
-        cross_entropy_loss
-        + load_balance_coef
-        * load_balance_loss
-    )
-
-    model_params = tuple(model.params())
-    # 计算权重更新量
-    pseudo_grads = torch.autograd.grad(
-        training_loss,
-        model_params,
-        create_graph=False,
-        retain_graph=False,
-        allow_unused=True
-    )
-
-    pseudo_grads = tuple(
-        torch.zeros_like(param)
-        if grad is None
-        else grad.detach()
-        for param, grad in zip(
-            model_params,
-            pseudo_grads
-        )
-    )
-
-    # 只对专家参数按“实际路由到该专家的样本数”做内部平均。
-    #
-    # CrossEntropyLoss 默认对整个 batch 取 mean。
-    # 当前专家反向不再乘 Gate 权重，因此专家 e 的原始梯度为：
-    #
-    #     g_e = (1 / B) * sum_{i routed to e} g_i
-    #
-    # 令 n_e 为当前 batch 中实际路由到专家 e 的样本数，
-    # 对专家参数梯度乘 B / n_e 后得到：
-    #
-    #     g_e_mean = (1 / n_e) * sum_{i routed to e} g_i
-    #
-    # backbone、BN、Gate 等非专家参数完全不改。
-    expert_routed_counts = torch.bincount(
-        selected_experts.reshape(-1),
-        minlength=model.fc.num_experts
-    ).to(
-        device=device,
-        dtype=torch.float32
-    )
-
-    model_param_names = [
-        name
-        for name, _ in model.named_params(model)
-    ]
-
-    if len(model_param_names) != len(pseudo_grads):
-        raise RuntimeError(
-            '参数名称数量与客户端梯度数量不一致'
-        )
-
-    routed_mean_pseudo_grads = []
-    batch_sample_count = float(data.size(0))
-
-    for param_name, grad in zip(
-        model_param_names,
-        pseudo_grads
-    ):
-        if param_name.startswith('fc.experts.'):
-            expert_id = int(
-                param_name.split('.')[2]
+            data = data.to(
+                device,
+                non_blocking=True
+            )
+            target = target.to(
+                device,
+                non_blocking=True
             )
 
-            routed_count = (
-                expert_routed_counts[expert_id]
+            optimizer.zero_grad(
+                set_to_none=True
             )
 
-            if routed_count.item() > 0:
-                grad = grad * (
-                    batch_sample_count
-                    / routed_count
+            output = model(data)
+
+            selected_experts = (
+                model.fc.last_selected_experts
+            )
+
+            if selected_experts is None:
+                raise RuntimeError(
+                    'model.fc.last_selected_experts is None.'
                 )
-            else:
-                grad = torch.zeros_like(grad)
 
-        routed_mean_pseudo_grads.append(
-            grad
+            # 保持原 Meta 输入定义不变：
+            # 这里仍记录原始 activation frequency。
+            expert_activation_frequency = (
+                torch.bincount(
+                    selected_experts.reshape(-1),
+                    minlength=model.fc.num_experts
+                ).to(
+                    device=device,
+                    dtype=torch.float32
+                )
+                / data.size(0)
+            )
+
+            cross_entropy_loss = criterion(
+                output,
+                target
+            )
+
+            load_balance_loss = (
+                model.fc.last_load_balance_loss
+            )
+
+            if load_balance_loss is None:
+                raise RuntimeError(
+                    'model.fc.last_load_balance_loss is None.'
+                )
+
+            training_loss = (
+                cross_entropy_loss
+                + load_balance_coef
+                * load_balance_loss
+            )
+
+            # 与 FedAvg 完全一致：先 backward。
+            training_loss.backward()
+
+            # 与 FedAvg_LN_s.py 中相同的 expert gradient 处理代码。
+            selected_experts = (
+                model.fc.last_selected_experts
+            )
+
+            expert_routed_counts = torch.bincount(
+                selected_experts.reshape(-1),
+                minlength=model.fc.num_experts
+            ).to(
+                device=device,
+                dtype=torch.float32
+            )
+
+            batch_sample_count = float(
+                data.size(0)
+            )
+
+            for param_name, param in (
+                model.named_parameters()
+            ):
+                if not param_name.startswith(
+                    'fc.experts.'
+                ):
+                    continue
+
+                if param.grad is None:
+                    continue
+
+                expert_id = int(
+                    param_name.split('.')[2]
+                )
+
+                routed_count = (
+                    expert_routed_counts[expert_id]
+                )
+
+                if routed_count.item() > 0:
+                    param.grad.mul_(
+                        batch_sample_count
+                        / routed_count
+                    )
+                else:
+                    param.grad.zero_()
+
+            # 关键修改：不再返回裸梯度，
+            # 而是和 FedAvg 一样执行真实 SGD update。
+            optimizer.step()
+
+            train_loss += (
+                cross_entropy_loss.item()
+            )
+            trained_batches += 1
+
+            last_cross_entropy_loss = (
+                cross_entropy_loss.detach()
+            )
+            last_load_balance_loss = (
+                load_balance_loss.detach()
+            )
+            last_activation_frequency = (
+                expert_activation_frequency.detach()
+            )
+
+    if trained_batches == 0:
+        raise RuntimeError(
+            'Client train loader has no batch.'
         )
 
-    pseudo_grads = tuple(
-        routed_mean_pseudo_grads
-    )
+    # 与 FedAvg 一致：
+    # 返回完整 local_state - global_state 更新量，放在 CPU。
+    weight_updates = {}
+
+    for name, value in model.state_dict().items():
+        current_cpu = value.detach().cpu()
+        reference_cpu = global_state_cpu[name]
+
+        weight_updates[name] = (
+            current_cpu - reference_cpu
+        )
 
     return (
-        cross_entropy_loss.detach(),
-        load_balance_loss.detach(),
-        expert_activation_frequency.detach(),
-        pseudo_grads
+        train_loss / trained_batches,
+        last_cross_entropy_loss,
+        last_load_balance_loss,
+        last_activation_frequency,
+        weight_updates
     )
 
 parser = argparse.ArgumentParser(
@@ -404,7 +504,7 @@ parser.add_argument(
 parser.add_argument(
     '--use_dirichlet',
     type=str,
-    default='false',
+    default='true',
     help='Whether to use Dirichlet distribution for data splitting.'
 )
 
@@ -442,7 +542,7 @@ os.makedirs(
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_lossz_'
+    f'./log2/Meta_LN_s_z_update_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -483,8 +583,10 @@ meta_bs = 128
 meta_sample_number = 1000
 
 # FL model parameters
-lr = 0.025
+lr = 0.01
 min_lr = 0.0001
+# 学习率在前 decay_end_round 轮完成 cosine 衰减，之后固定为 min_lr。
+decay_end_round = 400
 decay_factor = 0.996
 
 # Meta model parameters
@@ -494,7 +596,7 @@ meta_lr = 1e-4
 meta_weight_decay = 0
 
 nesterov = True
-momentum = 0.905
+momentum = 0.9
 weight_decay = 5e-4
 
 # Top-2 MoE 负载均衡辅助损失系数。
@@ -548,94 +650,21 @@ optimizer_model = torch.optim.SGD(
 # 模拟多个客户端
 client_model = build_model(dataset).to(device)
 
-# ============================================================
-# 初始化元学习网络：严格从 loss-only 的函数起点开始
-# ============================================================
-# 先按原 loss-only 配置创建 1-input MLP。
-# 在相同随机状态下，它得到的参数就是原 loss-only MetaNet
-# 在这里应得到的初始化参数。
-loss_only_init_net = MLP(
-    input_size=1,
-    hidden_size=meta_net_hidden_size,
-    num_layers=meta_net_num_layers,
-    output_size=1
-).to(device)
+# 与 FedAvg 完全一致：
+# 每个客户端的 SGD momentum / Nesterov optimizer state 跨通信轮保留，
+# 非当前客户端的 optimizer state 存放在 CPU。
+client_optimizer_states = [
+    None
+    for _ in range(num_clients)
+]
 
-# 保存“原 loss-only MetaNet 初始化完成之后”的 RNG 状态。
-# 后面构造 2-input MLP 会额外消耗随机数，因此复制完参数后
-# 恢复这些状态，避免影响后续模型构造和 DataLoader 随机序列。
-rng_state_after_loss_only = torch.get_rng_state()
-if torch.cuda.is_available():
-    cuda_rng_state_after_loss_only = torch.cuda.get_rng_state_all()
-else:
-    cuda_rng_state_after_loss_only = None
-
-# 新 MetaNet 输入为 [loss_z, freq]。
+# 初始化元学习网络
 meta_net = MLP(
     input_size=2,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
     output_size=1
 ).to(device)
-
-# 复制原 loss-only 的全部函数参数：
-#   第 0 列 = 原 loss-only 的 loss 权重
-#   第 1 列 = 0（freq 初始完全不起作用）
-#   first-layer bias、其余 hidden layers、output layer 全部照搬。
-with torch.no_grad():
-    meta_net.first_hidden_layer.fc.weight[:, 0].copy_(
-        loss_only_init_net.first_hidden_layer.fc.weight[:, 0]
-    )
-    meta_net.first_hidden_layer.fc.weight[:, 1].zero_()
-    meta_net.first_hidden_layer.fc.bias.copy_(
-        loss_only_init_net.first_hidden_layer.fc.bias
-    )
-
-    meta_net.rest_hidden_layers.load_state_dict(
-        loss_only_init_net.rest_hidden_layers.state_dict()
-    )
-    meta_net.output_layer.load_state_dict(
-        loss_only_init_net.output_layer.state_dict()
-    )
-
-# 验证：初始化时，不论 freq 取什么值，2-input MetaNet 的输出
-# 都必须与原 loss-only MetaNet 完全一致。
-with torch.no_grad():
-    _check_loss = torch.tensor(
-        [[-1.0], [0.0], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _check_freq = torch.tensor(
-        [[0.0], [0.5], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _loss_only_output = loss_only_init_net(_check_loss)
-    _two_input_output = meta_net(
-        torch.cat([_check_loss, _check_freq], dim=1)
-    )
-
-    if not torch.allclose(
-        _loss_only_output,
-        _two_input_output,
-        atol=1e-7,
-        rtol=1e-6
-    ):
-        raise RuntimeError(
-            'MetaNet zero-freq initialization is not equivalent to loss-only.'
-        )
-
-# 恢复 RNG，使后续随机过程与原 loss-only 初始化后的状态一致。
-torch.set_rng_state(rng_state_after_loss_only)
-if cuda_rng_state_after_loss_only is not None:
-    torch.cuda.set_rng_state_all(cuda_rng_state_after_loss_only)
-
-del loss_only_init_net
-del _check_loss
-del _check_freq
-del _loss_only_output
-del _two_input_output
 
 meta_optimizer = torch.optim.Adam(
     meta_net.parameters(),
@@ -689,20 +718,19 @@ experiment_config = [
     "expert_aggregation=meta_mlp_client_weighting",
     "nonexpert_aggregation=fedavg_equal_weight",
     "meta_input=standardized_client_cross_entropy_loss,expert_activation_frequency",
-    "meta_input_size=2",
-    "meta_initialization=loss_only_equivalent",
-    "freq_first_layer_column_initialization=zeros",
-    "activation_frequency_definition=route_count_div_batch_size",
     "loss_standardization=zscore_per_round_across_clients",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
     "meta_loss=cross_entropy_only",
     f"lr_max={lr}",
     f"lr_min={min_lr}",
-    "lr_scheduler=cosine_annealing",
+    f"decay_end_round={decay_end_round}",
+    "lr_scheduler=cosine_annealing_with_fixed_min_after_decay_end",
     f"momentum={momentum}",
     f"nesterov={nesterov}",
     f"weight_decay={weight_decay}",
+    "client_update=real_sgd_parameter_delta",
+    "client_optimizer_state=persistent_per_client_on_cpu",
     f"load_balance_coef={load_balance_coef}",
     f"meta_hidden_size={meta_net_hidden_size}",
     f"meta_num_layers={meta_net_num_layers}",
@@ -726,7 +754,14 @@ fedavg_weight = torch.full(
 
 for round in range(num_rounds):
 
-    # 模型学习率余弦退火：从 lr 平滑衰减到 min_lr。
+    # 余弦退火只在前 decay_end_round 轮进行：
+    # round=0 时 current_lr=lr；
+    # round>=decay_end_round 时固定为 min_lr。
+    lr_progress = min(
+        round / decay_end_round,
+        1.0
+    )
+
     current_lr = (
         min_lr
         + 0.5
@@ -734,7 +769,7 @@ for round in range(num_rounds):
         * (
             1.0
             + math.cos(
-                math.pi * round / num_rounds
+                math.pi * lr_progress
             )
         )
     )
@@ -745,17 +780,26 @@ for round in range(num_rounds):
         global_model.state_dict()
     )
 
-    # 客户端训练并上传权重更新
+    # 与 FedAvg 一致：本轮所有客户端都从同一 global state 出发。
+    global_state_gpu = global_model.state_dict()
+    global_state_cpu = {
+        name: value.detach().cpu().clone()
+        for name, value in global_state_gpu.items()
+    }
+
+    # 客户端训练并上传真实 SGD 后的 local_state - global_state。
     client_losses = []
     client_expert_frequencies = []
-    grads_list = []
+    client_updates_list = []
 
     for i in range(num_clients):
         client_model.load_state_dict(
-            pseudo_net.state_dict()
+            global_state_gpu,
+            strict=True
         )
 
-        # 每个客户端使用新的独立优化器
+        # 与 FedAvg 一样：每轮为当前客户端创建 optimizer，
+        # 然后恢复该客户端上一轮保存在 CPU 的 momentum state。
         client_optimizer = torch.optim.SGD(
             client_model.params(),
             lr=current_lr,
@@ -764,7 +808,18 @@ for round in range(num_rounds):
             weight_decay=weight_decay
         )
 
+        if client_optimizer_states[i] is not None:
+            client_optimizer.load_state_dict(
+                client_optimizer_states[i]
+            )
+
+        # load_state_dict 会恢复上一轮 optimizer 中保存的 lr，
+        # 因此再次覆盖为当前轮 cosine LR。
+        for param_group in client_optimizer.param_groups:
+            param_group['lr'] = current_lr
+
         (
+            train_loss,
             loss,
             _load_balance_loss,
             expert_activation_frequency,
@@ -775,16 +830,30 @@ for round in range(num_rounds):
             criterion,
             client_optimizer,
             num_epochs,
-            num_batches
+            num_batches,
+            global_state_cpu,
+            load_balance_coef
         )
 
-        grads_list.append(weight_updates)
+        client_updates_list.append(
+            weight_updates
+        )
 
         # 元网络输入仍然是纯交叉熵 loss。
-        client_losses.append(loss.item())
+        client_losses.append(
+            float(train_loss)
+        )
 
         client_expert_frequencies.append(
             expert_activation_frequency
+        )
+
+        # 与 FedAvg 一致：保存该客户端 optimizer state 到 CPU，
+        # 下一通信轮恢复。
+        client_optimizer_states[i] = (
+            optimizer_state_to_cpu(
+                client_optimizer.state_dict()
+            )
         )
 
         del client_optimizer
@@ -914,78 +983,158 @@ for round in range(num_rounds):
     avg_client_loss = client_losses_tensor.mean().item()
 
 
-    # 聚合客户端梯度
     # ==================================================
-    # 按专家参数和非专家参数分别选择聚合方式
+    # 聚合客户端“真实 SGD 参数更新量”
     # ==================================================
+    #
+    # FedAvg:
+    #   delta_k = local_state_k - global_state
+    #
+    # 本方法：
+    #   - experts.* : 用 MetaNet 的 expert-specific client weights 聚合 delta
+    #   - 非 expert learnable tensors : 与 FedAvg 一样等权平均 delta
+    #   - BN running statistics 等非 learnable state : 与 FedAvg 一样等权平均
+    #
+    # 因此客户端 update operator 已与 FedAvg 对齐；
+    # 方法差异只保留在服务器 expert aggregation weight。
 
-    # 参数名称的顺序必须和 client_train_1() 中
-    # model.params() 返回的梯度顺序一致
-    param_names = [
-        name
-        for name, _ in pseudo_net.named_params(pseudo_net)
-    ]
-
-    if len(param_names) != len(grads_list[0]):
-        raise RuntimeError(
-            "参数名称数量与客户端梯度数量不一致"
+    pseudo_named_params = list(
+        pseudo_net.named_params(
+            pseudo_net
         )
+    )
 
-    aggregated_grads = []
+    param_name_set = {
+        name
+        for name, _ in pseudo_named_params
+    }
 
-    for param_index, param_name in enumerate(
-        param_names
+    # 先更新所有 learnable tensors。
+    # 对 expert 参数必须保留 expert_weights -> meta_loss 的计算图，
+    # 因此不能使用 torch.no_grad() 或 load_state_dict() 做这一部分。
+    for param_name, param_tensor in (
+        pseudo_named_params
     ):
-        # ----------------------------------------------
-        # 1. 判断当前参数属于专家还是非专家
-        # ----------------------------------------------
-        if param_name.startswith("fc.experts."):
-            # 参数名示例：
-            # fc.experts.0.fc1.weight
-            # fc.experts.1.fc2.bias
+        if param_name.startswith(
+            "fc.experts."
+        ):
             expert_id = int(
                 param_name.split('.')[2]
             )
-
-            # 当前专家专属的客户端权重
             current_weights = (
                 expert_weights[:, expert_id]
             )
         else:
-            # 卷积层、BN参数、Gate和其他非专家参数
-            # 继续使用客户端等权平均
             current_weights = fedavg_weight
 
-        # ----------------------------------------------
-        # 3. 聚合当前参数的所有客户端梯度
-        # ----------------------------------------------
-        aggregated_grad = torch.zeros_like(
-            grads_list[0][param_index]
+        aggregated_update = torch.zeros_like(
+            param_tensor
         )
 
         for client_id in range(num_clients):
-            aggregated_grad += (
-                grads_list[client_id][param_index]
+            client_update = (
+                client_updates_list[client_id][param_name]
+                .to(
+                    device=param_tensor.device,
+                    dtype=param_tensor.dtype
+                )
+            )
+
+            aggregated_update = (
+                aggregated_update
+                + client_update
                 * current_weights[client_id]
             )
 
-        aggregated_grads.append(
-            aggregated_grad
+        # 直接构造 global_param + aggregated_delta。
+        # 这与 FedAvg 的参数 delta 语义一致，
+        # 同时 expert 参数仍保持对 MetaNet 权重可微。
+        pseudo_net.set_param(
+            pseudo_net,
+            param_name,
+            param_tensor + aggregated_update
         )
 
-
-    # 更新伪模型
-    pseudo_net.update_params(
-        lr_inner=current_lr,
-        source_params=aggregated_grads
+    # 再处理 BN running_mean / running_var 等
+    # 不属于 named_params() 的 state_dict buffers。
+    #
+    # 这些状态在 FedAvg 中也是 local_state - global_state 后等权平均，
+    # 所以这里按完全相同的方式更新。
+    pseudo_state = pseudo_net.state_dict(
+        keep_vars=True
     )
+
+    with torch.no_grad():
+        for state_name, state_tensor in (
+            pseudo_state.items()
+        ):
+            if state_name in param_name_set:
+                continue
+
+            update_sum = None
+
+            for client_id in range(num_clients):
+                client_update_cpu = (
+                    client_updates_list[
+                        client_id
+                    ][state_name]
+                )
+
+                if update_sum is None:
+                    if (
+                        client_update_cpu.is_floating_point()
+                        or client_update_cpu.is_complex()
+                    ):
+                        update_sum = torch.zeros_like(
+                            client_update_cpu
+                        )
+                    else:
+                        update_sum = torch.zeros_like(
+                            client_update_cpu,
+                            dtype=torch.float32
+                        )
+
+                if (
+                    client_update_cpu.is_floating_point()
+                    or client_update_cpu.is_complex()
+                ):
+                    update_sum.add_(
+                        client_update_cpu
+                    )
+                else:
+                    update_sum.add_(
+                        client_update_cpu.float()
+                    )
+
+            if (
+                state_tensor.is_floating_point()
+                or state_tensor.is_complex()
+            ):
+                aggregated_state_update = (
+                    update_sum / num_clients
+                ).to(
+                    device=state_tensor.device,
+                    dtype=state_tensor.dtype
+                )
+            else:
+                aggregated_state_update = (
+                    update_sum / num_clients
+                ).round().to(
+                    device=state_tensor.device,
+                    dtype=state_tensor.dtype
+                )
+
+            state_tensor.add_(
+                aggregated_state_update
+            )
+
+    # 客户端 update 已经应用到 pseudo_net，
+    # 不再调用 pseudo_net.update_params(lr * raw_grad)。
 
 
     # ==================================================
     # 更新元学习网络
     # ==================================================
-    del aggregated_grads
-
     try:
         meta_inputs, meta_labels = next(
             meta_dataloader_iter

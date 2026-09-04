@@ -263,9 +263,9 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
             'model.fc.last_selected_experts is None.'
         )
 
-    # Top-2 专家激活频率按用户当前定义计算：
-    # activation_count / batch_size。
-    # 因为是 Top-2，所以所有专家频率之和为 2，而不是 1。
+    # 每个样本产生 top_k 次专家分配。
+    # 分母使用 batch_size * top_k，
+    # 使所有专家激活频率之和保持为 1。
     expert_activation_frequency = (
         torch.bincount(
             selected_experts.reshape(-1),
@@ -274,7 +274,7 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
             device=device,
             dtype=torch.float32
         )
-        / data.size(0)
+        / selected_experts.numel()
     )
 
     # 元网络输入仍然只使用交叉熵损失。
@@ -320,68 +320,7 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
         )
     )
 
-    # 只对专家参数按“实际路由到该专家的样本数”做内部平均。
-    #
-    # CrossEntropyLoss 默认对整个 batch 取 mean。
-    # 当前专家反向不再乘 Gate 权重，因此专家 e 的原始梯度为：
-    #
-    #     g_e = (1 / B) * sum_{i routed to e} g_i
-    #
-    # 令 n_e 为当前 batch 中实际路由到专家 e 的样本数，
-    # 对专家参数梯度乘 B / n_e 后得到：
-    #
-    #     g_e_mean = (1 / n_e) * sum_{i routed to e} g_i
-    #
-    # backbone、BN、Gate 等非专家参数完全不改。
-    expert_routed_counts = torch.bincount(
-        selected_experts.reshape(-1),
-        minlength=model.fc.num_experts
-    ).to(
-        device=device,
-        dtype=torch.float32
-    )
 
-    model_param_names = [
-        name
-        for name, _ in model.named_params(model)
-    ]
-
-    if len(model_param_names) != len(pseudo_grads):
-        raise RuntimeError(
-            '参数名称数量与客户端梯度数量不一致'
-        )
-
-    routed_mean_pseudo_grads = []
-    batch_sample_count = float(data.size(0))
-
-    for param_name, grad in zip(
-        model_param_names,
-        pseudo_grads
-    ):
-        if param_name.startswith('fc.experts.'):
-            expert_id = int(
-                param_name.split('.')[2]
-            )
-
-            routed_count = (
-                expert_routed_counts[expert_id]
-            )
-
-            if routed_count.item() > 0:
-                grad = grad * (
-                    batch_sample_count
-                    / routed_count
-                )
-            else:
-                grad = torch.zeros_like(grad)
-
-        routed_mean_pseudo_grads.append(
-            grad
-        )
-
-    pseudo_grads = tuple(
-        routed_mean_pseudo_grads
-    )
 
     return (
         cross_entropy_loss.detach(),
@@ -442,7 +381,7 @@ os.makedirs(
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_lossz_'
+    f'./log2/Meta_LN_s_old_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -494,7 +433,7 @@ meta_lr = 1e-4
 meta_weight_decay = 0
 
 nesterov = True
-momentum = 0.905
+momentum = 0.9
 weight_decay = 5e-4
 
 # Top-2 MoE 负载均衡辅助损失系数。
@@ -548,94 +487,13 @@ optimizer_model = torch.optim.SGD(
 # 模拟多个客户端
 client_model = build_model(dataset).to(device)
 
-# ============================================================
-# 初始化元学习网络：严格从 loss-only 的函数起点开始
-# ============================================================
-# 先按原 loss-only 配置创建 1-input MLP。
-# 在相同随机状态下，它得到的参数就是原 loss-only MetaNet
-# 在这里应得到的初始化参数。
-loss_only_init_net = MLP(
+# 初始化元学习网络
+meta_net = MLP(
     input_size=1,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
     output_size=1
 ).to(device)
-
-# 保存“原 loss-only MetaNet 初始化完成之后”的 RNG 状态。
-# 后面构造 2-input MLP 会额外消耗随机数，因此复制完参数后
-# 恢复这些状态，避免影响后续模型构造和 DataLoader 随机序列。
-rng_state_after_loss_only = torch.get_rng_state()
-if torch.cuda.is_available():
-    cuda_rng_state_after_loss_only = torch.cuda.get_rng_state_all()
-else:
-    cuda_rng_state_after_loss_only = None
-
-# 新 MetaNet 输入为 [loss_z, freq]。
-meta_net = MLP(
-    input_size=2,
-    hidden_size=meta_net_hidden_size,
-    num_layers=meta_net_num_layers,
-    output_size=1
-).to(device)
-
-# 复制原 loss-only 的全部函数参数：
-#   第 0 列 = 原 loss-only 的 loss 权重
-#   第 1 列 = 0（freq 初始完全不起作用）
-#   first-layer bias、其余 hidden layers、output layer 全部照搬。
-with torch.no_grad():
-    meta_net.first_hidden_layer.fc.weight[:, 0].copy_(
-        loss_only_init_net.first_hidden_layer.fc.weight[:, 0]
-    )
-    meta_net.first_hidden_layer.fc.weight[:, 1].zero_()
-    meta_net.first_hidden_layer.fc.bias.copy_(
-        loss_only_init_net.first_hidden_layer.fc.bias
-    )
-
-    meta_net.rest_hidden_layers.load_state_dict(
-        loss_only_init_net.rest_hidden_layers.state_dict()
-    )
-    meta_net.output_layer.load_state_dict(
-        loss_only_init_net.output_layer.state_dict()
-    )
-
-# 验证：初始化时，不论 freq 取什么值，2-input MetaNet 的输出
-# 都必须与原 loss-only MetaNet 完全一致。
-with torch.no_grad():
-    _check_loss = torch.tensor(
-        [[-1.0], [0.0], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _check_freq = torch.tensor(
-        [[0.0], [0.5], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _loss_only_output = loss_only_init_net(_check_loss)
-    _two_input_output = meta_net(
-        torch.cat([_check_loss, _check_freq], dim=1)
-    )
-
-    if not torch.allclose(
-        _loss_only_output,
-        _two_input_output,
-        atol=1e-7,
-        rtol=1e-6
-    ):
-        raise RuntimeError(
-            'MetaNet zero-freq initialization is not equivalent to loss-only.'
-        )
-
-# 恢复 RNG，使后续随机过程与原 loss-only 初始化后的状态一致。
-torch.set_rng_state(rng_state_after_loss_only)
-if cuda_rng_state_after_loss_only is not None:
-    torch.cuda.set_rng_state_all(cuda_rng_state_after_loss_only)
-
-del loss_only_init_net
-del _check_loss
-del _check_freq
-del _loss_only_output
-del _two_input_output
 
 meta_optimizer = torch.optim.Adam(
     meta_net.parameters(),
@@ -688,12 +546,10 @@ experiment_config = [
     "top2_output=renormalized_gate_weighted_sum",
     "expert_aggregation=meta_mlp_client_weighting",
     "nonexpert_aggregation=fedavg_equal_weight",
-    "meta_input=standardized_client_cross_entropy_loss,expert_activation_frequency",
-    "meta_input_size=2",
-    "meta_initialization=loss_only_equivalent",
-    "freq_first_layer_column_initialization=zeros",
-    "activation_frequency_definition=route_count_div_batch_size",
+    "meta_input=standardized_client_cross_entropy_loss",
+    "meta_input_size=1",
     "loss_standardization=zscore_per_round_across_clients",
+    "expert_activation_frequency_used_by_meta=false",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
     "meta_loss=cross_entropy_only",
@@ -780,7 +636,7 @@ for round in range(num_rounds):
 
         grads_list.append(weight_updates)
 
-        # 元网络输入仍然是纯交叉熵 loss。
+        # 元网络唯一输入是纯交叉熵 loss。
         client_losses.append(loss.item())
 
         client_expert_frequencies.append(
@@ -812,44 +668,25 @@ for round in range(num_rounds):
         client_losses_tensor - loss_mean
     ) / loss_std
 
-    # 对客户端 k、专家 e 构造：
-    # [standardized_client_loss_k, activation_frequency_k_e]
-    loss_features = (
+    # 元网络输入只有标准化后的客户端交叉熵 loss：
+    # [standardized_client_loss_k]
+    #
+    # 输入中没有专家激活频率或 expert_id，
+    # 同一客户端对所有专家产生相同的原始权重。
+    raw_client_weights = meta_net(
         standardized_client_losses_tensor
-        .unsqueeze(1)
-        .expand(
-            -1,
-            num_experts,
-            -1
-        )
-    )
-    # [num_clients, num_experts, 1]
-
-    frequency_features = (
-        client_expert_frequencies_tensor
-        .unsqueeze(-1)
-    )
-    # [num_clients, num_experts, 1]
-
-    client_expert_features = torch.cat(
-        [
-            loss_features,
-            frequency_features
-        ],
-        dim=2
-    )
-    # [num_clients, num_experts, 2]
-
-    # 每个客户端-专家对输出一个客户端聚合权重分数。
-    raw_expert_weights = meta_net(
-        client_expert_features.reshape(
-            -1,
-            2
-        )
     ).view(
         num_clients,
-        num_experts
+        1
     )
+
+    raw_expert_weights = (
+        raw_client_weights.expand(
+            -1,
+            num_experts
+        )
+    )
+    # [num_clients, num_experts]
 
     # 每个专家分别沿客户端维度归一化。
     # expert_weights[:, expert_id].sum() == 1
@@ -861,7 +698,8 @@ for round in range(num_rounds):
         ).clamp_min(1e-12)
     )
 
-    # 逐条记录元网络两个输入及对应输出权重。
+    # 逐条记录元网络输入、Top-2 激活频率统计及输出权重。
+    # activation_frequency 仅用于日志，不作为元网络输入。
     # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
     log_client_losses = (
         client_losses_tensor

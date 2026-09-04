@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from dataset.dataSplit_LN_new import get_data_loaders_new
 from model.model import MLP
-from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18
+from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18,ResNet10Lite
 import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
@@ -126,8 +126,9 @@ def build_model(dataset):
     #     dropRate=droprate
     # )
 
-    if dataset == 'cifar10':
+    if dataset in ['cifar10','cinic10']:
         model = SmallMetaConvNet(num_classes=10)
+        # model = ResNet10Lite(num_classes=10,num_experts=4,expert_hidden_dim=128)
     elif dataset == 'cifar100':
         model = SmallMetaConvNet(num_classes=100)
     elif dataset == 'clothing1m':
@@ -263,9 +264,9 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
             'model.fc.last_selected_experts is None.'
         )
 
-    # Top-2 专家激活频率按用户当前定义计算：
-    # activation_count / batch_size。
-    # 因为是 Top-2，所以所有专家频率之和为 2，而不是 1。
+    # 每个样本产生 top_k 次专家分配。
+    # 分母使用 batch_size * top_k，
+    # 使所有专家激活频率之和保持为 1。
     expert_activation_frequency = (
         torch.bincount(
             selected_experts.reshape(-1),
@@ -397,7 +398,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--dataset',
     type=str,
-    default='cifar10',
+    default='cinic10',
     help='The name of the dataset.'
 )
 
@@ -437,12 +438,12 @@ log_time_str = log_start_time.strftime(
 )
 
 os.makedirs(
-    './log2',
+    './log_lb',
     exist_ok=True
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_lossz_'
+    f'./log_lb/Meta_LN_s_z_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -493,8 +494,8 @@ meta_net_num_layers = 1
 meta_lr = 1e-4
 meta_weight_decay = 0
 
-nesterov = True
-momentum = 0.905
+nesterov = False
+momentum = 0.2
 weight_decay = 5e-4
 
 # Top-2 MoE 负载均衡辅助损失系数。
@@ -548,94 +549,13 @@ optimizer_model = torch.optim.SGD(
 # 模拟多个客户端
 client_model = build_model(dataset).to(device)
 
-# ============================================================
-# 初始化元学习网络：严格从 loss-only 的函数起点开始
-# ============================================================
-# 先按原 loss-only 配置创建 1-input MLP。
-# 在相同随机状态下，它得到的参数就是原 loss-only MetaNet
-# 在这里应得到的初始化参数。
-loss_only_init_net = MLP(
-    input_size=1,
-    hidden_size=meta_net_hidden_size,
-    num_layers=meta_net_num_layers,
-    output_size=1
-).to(device)
-
-# 保存“原 loss-only MetaNet 初始化完成之后”的 RNG 状态。
-# 后面构造 2-input MLP 会额外消耗随机数，因此复制完参数后
-# 恢复这些状态，避免影响后续模型构造和 DataLoader 随机序列。
-rng_state_after_loss_only = torch.get_rng_state()
-if torch.cuda.is_available():
-    cuda_rng_state_after_loss_only = torch.cuda.get_rng_state_all()
-else:
-    cuda_rng_state_after_loss_only = None
-
-# 新 MetaNet 输入为 [loss_z, freq]。
+# 初始化元学习网络
 meta_net = MLP(
     input_size=2,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
     output_size=1
 ).to(device)
-
-# 复制原 loss-only 的全部函数参数：
-#   第 0 列 = 原 loss-only 的 loss 权重
-#   第 1 列 = 0（freq 初始完全不起作用）
-#   first-layer bias、其余 hidden layers、output layer 全部照搬。
-with torch.no_grad():
-    meta_net.first_hidden_layer.fc.weight[:, 0].copy_(
-        loss_only_init_net.first_hidden_layer.fc.weight[:, 0]
-    )
-    meta_net.first_hidden_layer.fc.weight[:, 1].zero_()
-    meta_net.first_hidden_layer.fc.bias.copy_(
-        loss_only_init_net.first_hidden_layer.fc.bias
-    )
-
-    meta_net.rest_hidden_layers.load_state_dict(
-        loss_only_init_net.rest_hidden_layers.state_dict()
-    )
-    meta_net.output_layer.load_state_dict(
-        loss_only_init_net.output_layer.state_dict()
-    )
-
-# 验证：初始化时，不论 freq 取什么值，2-input MetaNet 的输出
-# 都必须与原 loss-only MetaNet 完全一致。
-with torch.no_grad():
-    _check_loss = torch.tensor(
-        [[-1.0], [0.0], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _check_freq = torch.tensor(
-        [[0.0], [0.5], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _loss_only_output = loss_only_init_net(_check_loss)
-    _two_input_output = meta_net(
-        torch.cat([_check_loss, _check_freq], dim=1)
-    )
-
-    if not torch.allclose(
-        _loss_only_output,
-        _two_input_output,
-        atol=1e-7,
-        rtol=1e-6
-    ):
-        raise RuntimeError(
-            'MetaNet zero-freq initialization is not equivalent to loss-only.'
-        )
-
-# 恢复 RNG，使后续随机过程与原 loss-only 初始化后的状态一致。
-torch.set_rng_state(rng_state_after_loss_only)
-if cuda_rng_state_after_loss_only is not None:
-    torch.cuda.set_rng_state_all(cuda_rng_state_after_loss_only)
-
-del loss_only_init_net
-del _check_loss
-del _check_freq
-del _loss_only_output
-del _two_input_output
 
 meta_optimizer = torch.optim.Adam(
     meta_net.parameters(),
@@ -689,10 +609,6 @@ experiment_config = [
     "expert_aggregation=meta_mlp_client_weighting",
     "nonexpert_aggregation=fedavg_equal_weight",
     "meta_input=standardized_client_cross_entropy_loss,expert_activation_frequency",
-    "meta_input_size=2",
-    "meta_initialization=loss_only_equivalent",
-    "freq_first_layer_column_initialization=zeros",
-    "activation_frequency_definition=route_count_div_batch_size",
     "loss_standardization=zscore_per_round_across_clients",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",

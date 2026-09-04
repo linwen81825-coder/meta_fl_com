@@ -241,11 +241,141 @@ def test_model(model, test_loader, criterion):
     return test_loss, accuracy
 
 
+
+def copy_bn_running_stats(source_model, target_model):
+    """
+    Copy only BatchNorm running statistics from source_model to target_model.
+
+    Important for this project: MetaConv/MetaLinear/BN affine weights are
+    registered as buffers too, so we must NOT copy all named_buffers().
+    Only running_mean / running_var / num_batches_tracked are non-learnable
+    BN state that should follow the pseudo model's meta-batch forward.
+    """
+    source_buffers = dict(source_model.named_buffers())
+    target_buffers = dict(target_model.named_buffers())
+
+    bn_state_suffixes = (
+        'running_mean',
+        'running_var',
+        'num_batches_tracked',
+    )
+
+    with torch.no_grad():
+        for name, source_buffer in source_buffers.items():
+            if not name.endswith(bn_state_suffixes):
+                continue
+
+            if name not in target_buffers:
+                raise RuntimeError(
+                    f'BN buffer {name} not found in target model.'
+                )
+
+            target_buffers[name].copy_(source_buffer)
+
+
+def recompute_loss_and_frequency_after_pseudo_update(
+    model,
+    client_batches,
+    criterion
+):
+    """
+    Scheme B 的第二次输入：在 pseudo update 后，用每个客户端
+    第一次训练时的同一批样本重新计算 [loss_after, freq_after]。
+
+    使用 eval() + no_grad()，因此这一步不会再次训练模型，
+    也不会额外修改 BatchNorm running statistics。
+
+    激活频率保持本文件原有定义：route_count / batch_size。
+    Top-2 时所有专家频率之和为 2。
+    """
+    was_training = model.training
+    model.eval()
+
+    after_losses = []
+    after_frequencies = []
+
+    with torch.no_grad():
+        for batch_data, batch_target in client_batches:
+            batch_data = batch_data.to(
+                device,
+                non_blocking=True
+            )
+            batch_target = batch_target.to(
+                device,
+                non_blocking=True
+            )
+
+            output = model(batch_data)
+
+            loss = criterion(
+                output,
+                batch_target
+            )
+            after_losses.append(loss.detach())
+
+            selected_experts = (
+                model.fc.last_selected_experts
+            )
+
+            if selected_experts is None:
+                raise RuntimeError(
+                    'model.fc.last_selected_experts is None ' 
+                    'during second-stage feature recomputation.'
+                )
+
+            frequency = (
+                torch.bincount(
+                    selected_experts.reshape(-1),
+                    minlength=model.fc.num_experts
+                ).to(
+                    device=device,
+                    dtype=torch.float32
+                )
+                / batch_data.size(0)
+            )
+
+            after_frequencies.append(
+                frequency.detach()
+            )
+
+    if was_training:
+        model.train()
+
+    after_losses_tensor = torch.stack(
+        after_losses,
+        dim=0
+    ).view(-1, 1)
+
+    after_loss_mean = after_losses_tensor.mean()
+    after_loss_std = after_losses_tensor.std(
+        unbiased=False
+    ).clamp_min(1e-12)
+
+    standardized_after_losses_tensor = (
+        after_losses_tensor - after_loss_mean
+    ) / after_loss_std
+
+    after_frequencies_tensor = torch.stack(
+        after_frequencies,
+        dim=0
+    )
+
+    return (
+        after_losses_tensor,
+        standardized_after_losses_tensor,
+        after_frequencies_tensor
+    )
+
+
 def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_batches):
     model.train()
 
-    # 只训练一个epoch和一个batch
+    # 只训练一个epoch和一个batch。
+    # 同时保留这一批原始 CPU 数据，供 pseudo update 后重新评估
+    # 第二次 MetaNet 输入；这样不会再次迭代 DataLoader。
     data, target = next(iter(train_loader))
+    same_batch_data = data.detach().cpu()
+    same_batch_target = target.detach().cpu()
     data, target = data.to(device), target.to(device)
 
     optimizer.zero_grad()
@@ -263,9 +393,9 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
             'model.fc.last_selected_experts is None.'
         )
 
-    # Top-2 专家激活频率按用户当前定义计算：
-    # activation_count / batch_size。
-    # 因为是 Top-2，所以所有专家频率之和为 2，而不是 1。
+    # 每个样本产生 top_k 次专家分配。
+    # 分母使用 batch_size * top_k，
+    # 使所有专家激活频率之和保持为 1。
     expert_activation_frequency = (
         torch.bincount(
             selected_experts.reshape(-1),
@@ -387,7 +517,9 @@ def client_train_1(model, train_loader, criterion, optimizer, num_epochs, num_ba
         cross_entropy_loss.detach(),
         load_balance_loss.detach(),
         expert_activation_frequency.detach(),
-        pseudo_grads
+        pseudo_grads,
+        same_batch_data,
+        same_batch_target
     )
 
 parser = argparse.ArgumentParser(
@@ -442,7 +574,7 @@ os.makedirs(
 )
 
 log_file_path = (
-    f'./log2/Meta_LN_s_lossz_'
+    f'./log2/Meta_LN_s_two_stage_meta_'
     f'{dataset}_'
     f'{log_time_str}.log'
 )
@@ -494,7 +626,7 @@ meta_lr = 1e-4
 meta_weight_decay = 0
 
 nesterov = True
-momentum = 0.905
+momentum = 0.91
 weight_decay = 5e-4
 
 # Top-2 MoE 负载均衡辅助损失系数。
@@ -548,94 +680,13 @@ optimizer_model = torch.optim.SGD(
 # 模拟多个客户端
 client_model = build_model(dataset).to(device)
 
-# ============================================================
-# 初始化元学习网络：严格从 loss-only 的函数起点开始
-# ============================================================
-# 先按原 loss-only 配置创建 1-input MLP。
-# 在相同随机状态下，它得到的参数就是原 loss-only MetaNet
-# 在这里应得到的初始化参数。
-loss_only_init_net = MLP(
-    input_size=1,
-    hidden_size=meta_net_hidden_size,
-    num_layers=meta_net_num_layers,
-    output_size=1
-).to(device)
-
-# 保存“原 loss-only MetaNet 初始化完成之后”的 RNG 状态。
-# 后面构造 2-input MLP 会额外消耗随机数，因此复制完参数后
-# 恢复这些状态，避免影响后续模型构造和 DataLoader 随机序列。
-rng_state_after_loss_only = torch.get_rng_state()
-if torch.cuda.is_available():
-    cuda_rng_state_after_loss_only = torch.cuda.get_rng_state_all()
-else:
-    cuda_rng_state_after_loss_only = None
-
-# 新 MetaNet 输入为 [loss_z, freq]。
+# 初始化元学习网络
 meta_net = MLP(
     input_size=2,
     hidden_size=meta_net_hidden_size,
     num_layers=meta_net_num_layers,
     output_size=1
 ).to(device)
-
-# 复制原 loss-only 的全部函数参数：
-#   第 0 列 = 原 loss-only 的 loss 权重
-#   第 1 列 = 0（freq 初始完全不起作用）
-#   first-layer bias、其余 hidden layers、output layer 全部照搬。
-with torch.no_grad():
-    meta_net.first_hidden_layer.fc.weight[:, 0].copy_(
-        loss_only_init_net.first_hidden_layer.fc.weight[:, 0]
-    )
-    meta_net.first_hidden_layer.fc.weight[:, 1].zero_()
-    meta_net.first_hidden_layer.fc.bias.copy_(
-        loss_only_init_net.first_hidden_layer.fc.bias
-    )
-
-    meta_net.rest_hidden_layers.load_state_dict(
-        loss_only_init_net.rest_hidden_layers.state_dict()
-    )
-    meta_net.output_layer.load_state_dict(
-        loss_only_init_net.output_layer.state_dict()
-    )
-
-# 验证：初始化时，不论 freq 取什么值，2-input MetaNet 的输出
-# 都必须与原 loss-only MetaNet 完全一致。
-with torch.no_grad():
-    _check_loss = torch.tensor(
-        [[-1.0], [0.0], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _check_freq = torch.tensor(
-        [[0.0], [0.5], [1.0]],
-        dtype=torch.float32,
-        device=device
-    )
-    _loss_only_output = loss_only_init_net(_check_loss)
-    _two_input_output = meta_net(
-        torch.cat([_check_loss, _check_freq], dim=1)
-    )
-
-    if not torch.allclose(
-        _loss_only_output,
-        _two_input_output,
-        atol=1e-7,
-        rtol=1e-6
-    ):
-        raise RuntimeError(
-            'MetaNet zero-freq initialization is not equivalent to loss-only.'
-        )
-
-# 恢复 RNG，使后续随机过程与原 loss-only 初始化后的状态一致。
-torch.set_rng_state(rng_state_after_loss_only)
-if cuda_rng_state_after_loss_only is not None:
-    torch.cuda.set_rng_state_all(cuda_rng_state_after_loss_only)
-
-del loss_only_init_net
-del _check_loss
-del _check_freq
-del _loss_only_output
-del _two_input_output
 
 meta_optimizer = torch.optim.Adam(
     meta_net.parameters(),
@@ -687,12 +738,15 @@ experiment_config = [
     "top_k=2",
     "top2_output=renormalized_gate_weighted_sum",
     "expert_aggregation=meta_mlp_client_weighting",
+    "meta_weight_schedule=two_stage_pseudo_then_reobserve_then_recompute",
+    "meta_input_stage1=loss_before_z,frequency_before",
+    "meta_input_stage2=loss_after_z,frequency_after",
+    "stage2_batch=same_batch_as_stage1_client_training",
+    "stage2_feature_eval=eval_no_grad",
+    "pseudo_update_weights=meta_net_before_meta_step",
+    "global_update_weights=meta_net_after_meta_step",
     "nonexpert_aggregation=fedavg_equal_weight",
     "meta_input=standardized_client_cross_entropy_loss,expert_activation_frequency",
-    "meta_input_size=2",
-    "meta_initialization=loss_only_equivalent",
-    "freq_first_layer_column_initialization=zeros",
-    "activation_frequency_definition=route_count_div_batch_size",
     "loss_standardization=zscore_per_round_across_clients",
     "client_loss_for_meta=cross_entropy_only",
     "client_training_loss=cross_entropy+load_balance",
@@ -709,6 +763,7 @@ experiment_config = [
     f"meta_optimizer=Adam",
     f"meta_lr={meta_lr}",
     f"meta_weight_decay={meta_weight_decay}",
+    "two_stage_bn_state=copy_from_pseudo_meta_forward",
     "EXPERIMENT_CONFIG_END",
 ]
 
@@ -749,6 +804,7 @@ for round in range(num_rounds):
     client_losses = []
     client_expert_frequencies = []
     grads_list = []
+    client_same_batches = []
 
     for i in range(num_clients):
         client_model.load_state_dict(
@@ -768,7 +824,9 @@ for round in range(num_rounds):
             loss,
             _load_balance_loss,
             expert_activation_frequency,
-            weight_updates
+            weight_updates,
+            same_batch_data,
+            same_batch_target
         ) = client_train_1(
             client_model,
             train_dataloaders[i],
@@ -785,6 +843,13 @@ for round in range(num_rounds):
 
         client_expert_frequencies.append(
             expert_activation_frequency
+        )
+
+        client_same_batches.append(
+            (
+                same_batch_data,
+                same_batch_target
+            )
         )
 
         del client_optimizer
@@ -840,8 +905,11 @@ for round in range(num_rounds):
     )
     # [num_clients, num_experts, 2]
 
-    # 每个客户端-专家对输出一个客户端聚合权重分数。
-    raw_expert_weights = meta_net(
+    # ==================================================
+    # 第一次元网络前向：只用于构造可微的 pseudo update
+    # ==================================================
+    # 此时 meta_net 还是本轮 meta update 之前的参数。
+    pseudo_raw_expert_weights = meta_net(
         client_expert_features.reshape(
             -1,
             2
@@ -852,75 +920,19 @@ for round in range(num_rounds):
     )
 
     # 每个专家分别沿客户端维度归一化。
-    # expert_weights[:, expert_id].sum() == 1
-    expert_weights = (
-        raw_expert_weights
-        / raw_expert_weights.sum(
+    # pseudo_expert_weights[:, expert_id].sum() == 1
+    pseudo_expert_weights = (
+        pseudo_raw_expert_weights
+        / pseudo_raw_expert_weights.sum(
             dim=0,
             keepdim=True
         ).clamp_min(1e-12)
     )
 
-    # 逐条记录元网络两个输入及对应输出权重。
-    # round_id 使用 1-based；client_id 和 expert_id 使用 0-based。
-    log_client_losses = (
-        client_losses_tensor
-        .detach()
-        .cpu()
-        .view(-1)
-    )
-
-    log_activation_frequencies = (
-        client_expert_frequencies_tensor
-        .detach()
-        .cpu()
-    )
-
-    log_raw_weights = (
-        raw_expert_weights
-        .detach()
-        .cpu()
-    )
-
-    log_normalized_weights = (
-        expert_weights
-        .detach()
-        .cpu()
-    )
-
-    meta_weight_log_lines = []
-
-    for client_id in range(num_clients):
-        for expert_id in range(num_experts):
-            meta_weight_log_lines.append(
-                "META_WEIGHT_LOG "
-                f"round_id={round + 1} "
-                f"client_id={client_id} "
-                f"expert_id={expert_id} "
-                f"client_loss={log_client_losses[client_id].item():.10f} "
-                f"activation_frequency="
-                f"{log_activation_frequencies[client_id, expert_id].item():.10f} "
-                f"raw_weight="
-                f"{log_raw_weights[client_id, expert_id].item():.10f} "
-                f"normalized_weight="
-                f"{log_normalized_weights[client_id, expert_id].item():.10f}"
-            )
-
-    print(
-        "\n".join(meta_weight_log_lines),
-        flush=True
-    )
-
     avg_client_loss = client_losses_tensor.mean().item()
 
-
-    # 聚合客户端梯度
-    # ==================================================
-    # 按专家参数和非专家参数分别选择聚合方式
-    # ==================================================
-
     # 参数名称的顺序必须和 client_train_1() 中
-    # model.params() 返回的梯度顺序一致
+    # model.params() 返回的梯度顺序一致。
     param_names = [
         name
         for name, _ in pseudo_net.named_params(pseudo_net)
@@ -931,34 +943,28 @@ for round in range(num_rounds):
             "参数名称数量与客户端梯度数量不一致"
         )
 
-    aggregated_grads = []
+    # ==================================================
+    # 第一次聚合：使用 meta update 之前的权重
+    # 这里只更新 pseudo_net，不更新 global_model。
+    # ==================================================
+    pseudo_aggregated_grads = []
 
     for param_index, param_name in enumerate(
         param_names
     ):
-        # ----------------------------------------------
-        # 1. 判断当前参数属于专家还是非专家
-        # ----------------------------------------------
         if param_name.startswith("fc.experts."):
-            # 参数名示例：
-            # fc.experts.0.fc1.weight
-            # fc.experts.1.fc2.bias
             expert_id = int(
                 param_name.split('.')[2]
             )
 
-            # 当前专家专属的客户端权重
+            # 专家参数：第一次元网络权重。
             current_weights = (
-                expert_weights[:, expert_id]
+                pseudo_expert_weights[:, expert_id]
             )
         else:
-            # 卷积层、BN参数、Gate和其他非专家参数
-            # 继续使用客户端等权平均
+            # 非专家参数始终保持 FedAvg 等权聚合。
             current_weights = fedavg_weight
 
-        # ----------------------------------------------
-        # 3. 聚合当前参数的所有客户端梯度
-        # ----------------------------------------------
         aggregated_grad = torch.zeros_like(
             grads_list[0][param_index]
         )
@@ -969,23 +975,24 @@ for round in range(num_rounds):
                 * current_weights[client_id]
             )
 
-        aggregated_grads.append(
+        pseudo_aggregated_grads.append(
             aggregated_grad
         )
 
-
-    # 更新伪模型
+    # --------------------------------------------------
+    # Step 1: differentiable pseudo update
+    # --------------------------------------------------
+    # pseudo_aggregated_grads 中的专家部分依赖
+    # pseudo_expert_weights，因此 meta_loss 可以通过
+    # pseudo_net 反向传播到 meta_net。
     pseudo_net.update_params(
         lr_inner=current_lr,
-        source_params=aggregated_grads
+        source_params=pseudo_aggregated_grads
     )
 
-
     # ==================================================
-    # 更新元学习网络
+    # Step 2: 用 meta batch 更新元网络
     # ==================================================
-    del aggregated_grads
-
     try:
         meta_inputs, meta_labels = next(
             meta_dataloader_iter
@@ -1010,16 +1017,287 @@ for round in range(num_rounds):
     )
 
     meta_optimizer.zero_grad()
-
     meta_loss.backward()
-
     meta_optimizer.step()
 
-    # 两种模式都更新全局模型
-    global_model.load_state_dict(
-        pseudo_net.state_dict()
+    # 第一次聚合梯度只服务于 pseudo update 和 meta-gradient，
+    # 此后不再用于真正的 global update。
+    del pseudo_aggregated_grads
+
+    # ==================================================
+    # Scheme B - Step 3: pseudo update 后重新观察 loss 和 freq
+    # ==================================================
+    # 第二次输入不再复用第一次的 [loss_before_z, freq_before]。
+    # 使用每个客户端第一次训练时保存的同一批样本，
+    # 在 pseudo_net 上重新计算 [loss_after_z, freq_after]。
+    (
+        client_losses_after_tensor,
+        standardized_client_losses_after_tensor,
+        client_expert_frequencies_after_tensor
+    ) = recompute_loss_and_frequency_after_pseudo_update(
+        pseudo_net,
+        client_same_batches,
+        criterion
     )
 
+    # 保存的 batch 至此不再使用，尽早释放 CPU 引用。
+    del client_same_batches
+
+    loss_features_after = (
+        standardized_client_losses_after_tensor
+        .unsqueeze(1)
+        .expand(
+            -1,
+            num_experts,
+            -1
+        )
+    )
+
+    frequency_features_after = (
+        client_expert_frequencies_after_tensor
+        .unsqueeze(-1)
+    )
+
+    final_client_expert_features = torch.cat(
+        [
+            loss_features_after,
+            frequency_features_after
+        ],
+        dim=2
+    )
+
+    # ==================================================
+    # Scheme B - Step 4: 更新后的 MetaNet 使用新二元输入
+    # ==================================================
+    # 第二次权重只用于真正的全局模型更新，
+    # 不需要再对 meta_net 建图。
+    with torch.no_grad():
+        final_raw_expert_weights = meta_net(
+            final_client_expert_features.reshape(
+                -1,
+                2
+            )
+        ).view(
+            num_clients,
+            num_experts
+        )
+
+        final_expert_weights = (
+            final_raw_expert_weights
+            / final_raw_expert_weights.sum(
+                dim=0,
+                keepdim=True
+            ).clamp_min(1e-12)
+        )
+
+    # ==================================================
+    # 记录两阶段输入变化和元网络权重变化
+    # ==================================================
+    with torch.no_grad():
+        loss_z_delta = (
+            standardized_client_losses_after_tensor
+            - standardized_client_losses_tensor
+        )
+        frequency_delta = (
+            client_expert_frequencies_after_tensor
+            - client_expert_frequencies_tensor
+        )
+        mean_abs_loss_z_delta = (
+            loss_z_delta.abs().mean().item()
+        )
+        mean_abs_frequency_delta = (
+            frequency_delta.abs().mean().item()
+        )
+
+    log_client_losses = (
+        client_losses_tensor
+        .detach()
+        .cpu()
+        .view(-1)
+    )
+
+    log_activation_frequencies = (
+        client_expert_frequencies_tensor
+        .detach()
+        .cpu()
+    )
+
+    log_client_losses_after = (
+        client_losses_after_tensor
+        .detach()
+        .cpu()
+        .view(-1)
+    )
+
+    log_loss_z_before = (
+        standardized_client_losses_tensor
+        .detach()
+        .cpu()
+        .view(-1)
+    )
+
+    log_loss_z_after = (
+        standardized_client_losses_after_tensor
+        .detach()
+        .cpu()
+        .view(-1)
+    )
+
+    log_activation_frequencies_after = (
+        client_expert_frequencies_after_tensor
+        .detach()
+        .cpu()
+    )
+
+    log_pseudo_raw_weights = (
+        pseudo_raw_expert_weights
+        .detach()
+        .cpu()
+    )
+
+    log_pseudo_normalized_weights = (
+        pseudo_expert_weights
+        .detach()
+        .cpu()
+    )
+
+    log_final_raw_weights = (
+        final_raw_expert_weights
+        .detach()
+        .cpu()
+    )
+
+    log_final_normalized_weights = (
+        final_expert_weights
+        .detach()
+        .cpu()
+    )
+
+    normalized_weight_delta = (
+        final_expert_weights
+        - pseudo_expert_weights.detach()
+    )
+
+    mean_abs_weight_delta = (
+        normalized_weight_delta
+        .abs()
+        .mean()
+        .item()
+    )
+
+    max_abs_weight_delta = (
+        normalized_weight_delta
+        .abs()
+        .max()
+        .item()
+    )
+
+    meta_weight_log_lines = []
+
+    for client_id in range(num_clients):
+        for expert_id in range(num_experts):
+            meta_weight_log_lines.append(
+                "META_WEIGHT_LOG "
+                f"round_id={round + 1} "
+                f"client_id={client_id} "
+                f"expert_id={expert_id} "
+                f"client_loss_before={log_client_losses[client_id].item():.10f} "
+                f"client_loss_after={log_client_losses_after[client_id].item():.10f} "
+                f"loss_z_before={log_loss_z_before[client_id].item():.10f} "
+                f"loss_z_after={log_loss_z_after[client_id].item():.10f} "
+                f"activation_frequency_before="
+                f"{log_activation_frequencies[client_id, expert_id].item():.10f} "
+                f"activation_frequency_after="
+                f"{log_activation_frequencies_after[client_id, expert_id].item():.10f} "
+                f"pseudo_raw_weight="
+                f"{log_pseudo_raw_weights[client_id, expert_id].item():.10f} "
+                f"pseudo_normalized_weight="
+                f"{log_pseudo_normalized_weights[client_id, expert_id].item():.10f} "
+                f"final_raw_weight="
+                f"{log_final_raw_weights[client_id, expert_id].item():.10f} "
+                f"final_normalized_weight="
+                f"{log_final_normalized_weights[client_id, expert_id].item():.10f} "
+                f"normalized_weight_delta="
+                f"{normalized_weight_delta[client_id, expert_id].item():.10f}"
+            )
+
+    print(
+        "\n".join(meta_weight_log_lines),
+        flush=True
+    )
+
+    print(
+        "META_UPDATE_LOG "
+        f"round_id={round + 1} "
+        f"meta_loss={meta_loss.item():.10f} "
+        f"mean_abs_loss_z_delta={mean_abs_loss_z_delta:.10f} "
+        f"mean_abs_frequency_delta={mean_abs_frequency_delta:.10f} "
+        f"mean_abs_weight_delta={mean_abs_weight_delta:.10f} "
+        f"max_abs_weight_delta={max_abs_weight_delta:.10f}",
+        flush=True
+    )
+
+    # ==================================================
+    # Step 4: 使用更新后的第二次权重做真正的全局更新
+    # ==================================================
+    # 关键：必须从本轮开始时的 global_model 重新更新，
+    # 不能在已经 pseudo-update 的 pseudo_net 上再更新一次，
+    # 否则会把同一批客户端梯度应用两遍。
+    # 直接从本轮尚未更新的 global_model 应用第二次聚合梯度。
+    # 不再额外 build_model()，避免每轮额外消耗 RNG。
+    final_aggregated_grads = []
+
+    for param_index, param_name in enumerate(
+        param_names
+    ):
+        if param_name.startswith("fc.experts."):
+            expert_id = int(
+                param_name.split('.')[2]
+            )
+
+            # 专家参数：使用 meta_optimizer.step() 之后
+            # 元网络重新输出的第二次权重。
+            current_weights = (
+                final_expert_weights[:, expert_id]
+            )
+        else:
+            # 非专家参数保持 FedAvg 等权聚合。
+            current_weights = fedavg_weight
+
+        aggregated_grad = torch.zeros_like(
+            grads_list[0][param_index]
+        )
+
+        for client_id in range(num_clients):
+            aggregated_grad += (
+                grads_list[client_id][param_index]
+                * current_weights[client_id]
+            )
+
+        final_aggregated_grads.append(
+            aggregated_grad
+        )
+
+    # final_aggregated_grads 不再参与 meta-gradient。
+    # global_model 这里只作为本轮模型状态存储，因此在 no_grad 下更新，
+    # 避免把无用计算图跨轮保存在 global_model 中。
+    with torch.no_grad():
+        global_model.update_params(
+            lr_inner=current_lr,
+            source_params=final_aggregated_grads
+        )
+
+    # 原实现 global_model.load_state_dict(pseudo_net.state_dict()) 会把
+    # pseudo_net 在 meta batch 前向时更新的 BN running_mean/running_var
+    # 一并带回全局模型。两阶段改法不能丢掉这部分状态，否则测试阶段
+    # global_model.eval() 会长期使用接近初始化的 BN 统计量。
+    copy_bn_running_stats(
+        source_model=pseudo_net,
+        target_model=global_model
+    )
+
+    del final_aggregated_grads
+    del pseudo_net
 
     test_loss, test_accuracy = test_model(
         global_model,
@@ -1032,6 +1310,10 @@ for round in range(num_rounds):
     print(
         f"Round {round + 1} | "
         f"Client Loss: {avg_client_loss:.4f} | "
+        f"Meta Loss: {meta_loss.item():.4f} | "
+        f"LossZ Δ: {mean_abs_loss_z_delta:.3e} | "
+        f"Freq Δ: {mean_abs_frequency_delta:.3e} | "
+        f"Weight Δ: {mean_abs_weight_delta:.6e} | "
         f"Test Loss: {test_loss:.4f} | "
         f"Test Acc: {test_accuracy:.2f}% | "
         f"Best Acc: {best_acc:.2f}%",

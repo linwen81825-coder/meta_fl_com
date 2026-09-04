@@ -483,8 +483,8 @@ meta_bs = 128
 meta_sample_number = 1000
 
 # FL model parameters
-lr = 0.003
-min_lr = 0.0005
+lr = 0.025
+min_lr = 0.0001
 decay_factor = 0.996
 
 # Meta model parameters
