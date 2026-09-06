@@ -5,7 +5,10 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np 
 import copy 
 import torchvision 
-import torchvision.transforms as transforms 
+import torchvision.transforms as transforms
+import os
+from PIL import Image
+from torch.utils.data import Dataset 
 from collections import defaultdict, Counter 
  
  
@@ -31,7 +34,37 @@ def load_cifar100():
     testset = torchvision.datasets.CIFAR100(root='/home/lw/Project/data', train=False, download=True, transform=transform) 
     return trainset, testset 
  
- 
+def load_svhn():
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4377,0.4438,0.4728),
+            (0.1980,0.2010,0.1970)
+        )
+    ])
+
+
+    trainset = torchvision.datasets.SVHN(
+        root='data/svhn',
+        split='train',
+        download=False,
+        transform=transform
+    )
+
+
+    testset = torchvision.datasets.SVHN(
+        root='data/svhn',
+        split='test',
+        download=False,
+        transform=transform
+    )
+
+
+    trainset.targets = trainset.labels.tolist()
+    testset.targets = testset.labels.tolist()
+
+    return trainset,testset
 
 def load_cinic10():
     transform = transforms.Compose([
@@ -61,6 +94,184 @@ def load_cinic10():
     ]
 
     return trainset, testset
+
+
+def load_fashionmnist():
+    transform = transforms.Compose([
+        transforms.Resize((32,32)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.2860,0.2860,0.2860),
+            (0.3530,0.3530,0.3530)
+        )
+    ])
+
+    trainset = torchvision.datasets.FashionMNIST(
+        root='/home/lw/Project/data',
+        train=True,
+        download=False,
+        transform=transform
+    )
+
+    testset = torchvision.datasets.FashionMNIST(
+        root='/home/lw/Project/data',
+        train=False,
+        download=False,
+        transform=transform
+    )
+
+    return trainset, testset
+
+def load_stl10():
+
+    transform_train = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4467, 0.4398, 0.4066),
+            (0.2241, 0.2215, 0.2239)
+        )
+    ])
+
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4467, 0.4398, 0.4066),
+            (0.2241, 0.2215, 0.2239)
+        )
+    ])
+
+
+    trainset = torchvision.datasets.STL10(
+        root='data',
+        split='train',
+        download=True,
+        transform=transform_train
+    )
+
+
+    testset = torchvision.datasets.STL10(
+        root='data',
+        split='test',
+        download=True,
+        transform=transform_test
+    )
+
+
+    # STL10 使用 labels，不是 targets
+    trainset.targets = trainset.labels.tolist()
+    testset.targets = testset.labels.tolist()
+
+
+    return trainset, testset
+
+
+class TinyImageNetValDataset(Dataset):
+
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+
+        self.image_dir = os.path.join(
+            root,
+            'images'
+        )
+
+        with open(
+            os.path.join(root, '../wnids.txt'),
+            'r'
+        ) as f:
+            wnids = [
+                x.strip()
+                for x in f.readlines()
+            ]
+
+        self.class_to_idx = {
+            wnid: idx
+            for idx, wnid in enumerate(wnids)
+        }
+
+        self.samples = []
+
+        with open(
+            os.path.join(root, 'val_annotations.txt'),
+            'r'
+        ) as f:
+            for line in f.readlines():
+
+                img_name, class_name, _, _, _, _ = line.strip().split()
+
+                self.samples.append(
+                    (
+                        os.path.join(
+                            self.image_dir,
+                            img_name
+                        ),
+                        self.class_to_idx[class_name]
+                    )
+                )
+
+        self.targets = [
+            label for _, label in self.samples
+        ]
+
+        self.classes = wnids
+
+
+    def __len__(self):
+        return len(self.samples)
+
+
+    def __getitem__(self, index):
+
+        path, label = self.samples[index]
+
+        img = Image.open(path).convert('RGB')
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img, label
+
+
+
+def load_tinyimagenet():
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(64),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4802, 0.4481, 0.3975),
+            (0.2302, 0.2265, 0.2262)
+        )
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.Resize(64),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4802, 0.4481, 0.3975),
+            (0.2302, 0.2265, 0.2262)
+        )
+    ])
+
+    trainset = torchvision.datasets.ImageFolder(
+        root='data/tiny-imagenet-200/train',
+        transform=transform_train
+    )
+
+    testset = TinyImageNetValDataset(
+        root='data/tiny-imagenet-200/val',
+        transform=transform_test
+    )
+
+    trainset.targets = [label for _, label in trainset.samples]
+    testset.targets = [label for _, label in testset.samples]
+
+    return trainset, testset
+
 
 def stratified_sampling(dataset, num_samples_per_class): 
     # Convert dataset targets to a NumPy array for faster processing 
@@ -148,7 +359,9 @@ def split_dataset(
     dirichlet_alpha=0.5,
     imbalanced_factor=None
 ): 
-    if dataset == 'cifar100': 
+    if dataset == 'tinyimagenet':
+        num_classes = 200
+    elif dataset == 'cifar100': 
         num_classes = 100 
     else: 
         num_classes = 10 
@@ -263,16 +476,35 @@ def split_dataset(
     return metadata, clients_data 
  
  
-def introduce_label_noise(dataset, indices, noise_rate): 
-    """在子数据集中引入标签噪声""" 
-    targets = np.array(dataset.targets) 
-    num_noisy_labels = int(noise_rate * len(indices)) 
-    noisy_indices = np.random.choice(indices, num_noisy_labels, replace=False) 
-    new_labels = np.random.randint(0, 10, num_noisy_labels)  # CIFAR-10有10个类别 
-    for idx, noisy_idx in enumerate(noisy_indices): 
-        targets[noisy_idx] = new_labels[idx] 
-    dataset.targets = targets.tolist() 
- 
+def introduce_label_noise(dataset, indices, noise_rate):
+
+    targets = np.array(dataset.targets)
+
+    num_noisy_labels = int(
+        noise_rate * len(indices)
+    )
+
+    noisy_indices = np.random.choice(
+        indices,
+        num_noisy_labels,
+        replace=False
+    )
+
+    num_classes = len(
+        set(dataset.targets)
+    )
+
+    new_labels = np.random.randint(
+        0,
+        num_classes,
+        num_noisy_labels
+    )
+
+    for idx, noisy_idx in enumerate(noisy_indices):
+        targets[noisy_idx] = new_labels[idx]
+
+    dataset.targets = targets.tolist()
+
  
 def count_class_samples(dataset): 
     """统计每个类别的样本数量""" 
@@ -332,6 +564,14 @@ def get_data_loaders_new(
         trainset, testset = load_cifar100() 
     elif dataset == 'cinic10':
         trainset, testset = load_cinic10()
+    elif dataset == 'fashionmnist':
+        trainset, testset = load_fashionmnist()
+    elif dataset == 'svhn':
+        trainset, testset = load_svhn()
+    elif dataset == 'stl10':
+        trainset, testset = load_stl10()
+    elif dataset == 'tinyimagenet':
+        trainset, testset = load_tinyimagenet()
  
     metadata, clients_train_data = split_dataset(
         trainset,

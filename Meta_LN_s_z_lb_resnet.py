@@ -2,8 +2,21 @@ import torch
 import torch.nn as nn
 from dataset.dataSplit_LN_new import get_data_loaders_new
 from model.model import MLP
-from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18,ResNet20Lite,MetaResNetConvNet,MetaMobileNetV2Lite
+from model.wideresnet import (
+    SmallMetaConvNet, 
+    WideResNet,
+    SmallMetaConvNet1,
+    ResNet18,ResNet20Lite,
+    MetaResNetConvNet,
+    MetaMobileNetV2Lite,
+    MetaDenseNetLite,
+    SmallMetaDenseNet,
+    SmallMetaMobileNetV2,
+    SmallMetaEfficientNet,
+    SmallMetaVGG
+    )
 import datetime
+from model.shallow_resnet3_moe import ShallowResNet3MoE
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
 import math
@@ -98,37 +111,10 @@ class RoundOnlyConsoleLogger:
 
 
 
-# def build_model(dataset, layers=10, widen_factor=2, droprate=0):
 def build_model(dataset):
-#     if dataset == 'cifar10':
-#         model = ResNet18(num_classes=10)
-
-#     elif dataset == 'cifar100':
-#         model = ResNet18(num_classes=100)
-
-#     elif dataset == 'clothing1m':
-#         model = SmallMetaConvNet1(num_classes=14)
-
-#     else:
-#         raise ValueError(f"Unsupported dataset: {dataset}")
-
-#     if torch.cuda.is_available():
-#         model.cuda()
-#         torch.backends.cudnn.benchmark = True
-
-#     return model
-
-    # model = ResNet32(args.dataset == 'cifar10' and 10 or 100)
-    # model = WideResNet(
-    #     layers,
-    #     dataset == 'cifar10' and 10 or 100,
-    #     widen_factor,
-    #     dropRate=droprate
-    # )
-
     if dataset == 'cifar10':
         # model = SmallMetaConvNet(num_classes=10)
-        model = MetaMobileNetV2Lite(num_classes=10,num_experts=4,expert_hidden_dim=128)
+        model = SmallMetaVGG(num_classes=10,num_experts=4,expert_hidden_dim=128)
     elif dataset == 'cifar100':
         model = SmallMetaConvNet(num_classes=100)
     elif dataset == 'clothing1m':

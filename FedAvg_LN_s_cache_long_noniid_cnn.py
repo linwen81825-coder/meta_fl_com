@@ -26,6 +26,8 @@ from model.wideresnet import (
     SmallMetaConvNet,
     ResNet18,
     ResNet10Lite,
+    SmallMetaConvNet64,
+    SmallMetaConvNet96
 )
 
 
@@ -120,96 +122,19 @@ class RoundOnlyConsoleLogger:
         self._closed = True
 
 
-# def build_model(dataset):
-#     if dataset == 'cifar10':
-#         model = ResNet18MoE(
-#             num_classes=10,
-#             num_experts=4,
-#             expert_hidden_dim=128,
-#             top_k=2,
-#         )
-#
-#     elif dataset == 'cifar100':
-#         model = ShallowResNet5MoE(
-#             num_classes=100,
-#             num_experts=4,
-#             expert_hidden_dim=128,
-#             top_k=2
-#         )
-#
-#     else:
-#         raise ValueError(
-#             f"Unsupported dataset: {dataset}"
-#         )
-#
-#     if torch.cuda.is_available():
-#         model.cuda()
-#         torch.backends.cudnn.benchmark = True
-#
-#     return model
-#
-# def build_model(dataset):
-#     if dataset == 'cifar10':
-#         model = WideResNetMoE(
-#             depth=16,
-#             num_classes=10,
-#             widen_factor=2,
-#             dropRate=0.0,
-#             num_experts=4,
-#             expert_hidden_dim=128,
-#             top_k=2
-#         )
-#
-#     elif dataset == 'cifar100':
-#         model = WideResNetMoE(
-#             num_classes=100,
-#             dropRate=0.0,
-#             num_experts=4,
-#             expert_hidden_dim=128,
-#             top_k=2
-#         )
-#
-#     else:
-#         raise ValueError(
-#             f"Unsupported dataset: {dataset}"
-#         )
-#
-#     if torch.cuda.is_available():
-#         model.cuda()
-#         torch.backends.cudnn.benchmark = True
-#
-#     return model
-#
-# def build_model(dataset):
-#     if dataset == 'cifar10':
-#         model = ResNet18HalfMoE(
-#             num_classes=10,
-#             num_experts=4,
-#             expert_hidden_dim=128
-#         )
-#     elif dataset == 'cifar100':
-#         model = ResNet18HalfMoE(
-#             num_classes=100,
-#             num_experts=4,
-#             expert_hidden_dim=128
-#         )
-#
-#     model = model.to(device)
-#
-#     if torch.cuda.is_available():
-#         torch.backends.cudnn.benchmark = True
-#
-#     return model
 
 
 def build_model(dataset):
-    if dataset in ['cifar10','cinic10']:
+    if dataset in ['cifar10','cinic10','fashionmnist','svhn']:
         model = SmallMetaConvNet(num_classes=10)
-        # model = ResNet10Lite(num_classes=10,num_experts=4,expert_hidden_dim=128)
     elif dataset == 'cifar100':
         model = SmallMetaConvNet(num_classes=100)
+    elif dataset == 'tinyimagenet':
+        model = SmallMetaConvNet64(num_classes=200)
     elif dataset == 'clothing1m':
         model = SmallMetaConvNet1(num_classes=14)
+    elif dataset == 'stl10':
+        model = SmallMetaConvNet96(num_classes=10)
     else:
         raise ValueError(f'Unsupported dataset: {dataset}')
 
@@ -536,7 +461,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--dataset',
     type=str,
-    default='cinic10'
+    default='svhn'
 )
 
 parser.add_argument(

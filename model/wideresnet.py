@@ -1548,3 +1548,1686 @@ class MetaMobileNetV2Lite(MetaModule):
 
 
         return x
+class MetaDenseLayer(MetaModule):
+
+    """
+    DenseNet bottleneck layer
+
+    BN-ReLU-1x1 Conv
+    BN-ReLU-3x3 Conv
+    concat feature
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        growth_rate
+    ):
+
+        super(
+            MetaDenseLayer,
+            self
+        ).__init__()
+
+
+        self.bn1 = MetaBatchNorm2d(
+            in_channels
+        )
+
+        self.conv1 = MetaConv2d(
+            in_channels,
+            growth_rate * 4,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False
+        )
+
+
+        self.bn2 = MetaBatchNorm2d(
+            growth_rate * 4
+        )
+
+
+        self.conv2 = MetaConv2d(
+            growth_rate * 4,
+            growth_rate,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+    def forward(self,x):
+
+        out = F.relu(
+            self.bn1(x)
+        )
+
+        out = self.conv1(out)
+
+
+        out = F.relu(
+            self.bn2(out)
+        )
+
+        out = self.conv2(out)
+
+
+        # Dense connection
+        out = torch.cat(
+            [x,out],
+            dim=1
+        )
+
+        return out
+class MetaDenseBlock(MetaModule):
+
+    def __init__(
+        self,
+        num_layers,
+        in_channels,
+        growth_rate
+    ):
+
+        super(
+            MetaDenseBlock,
+            self
+        ).__init__()
+
+
+        layers=[]
+
+
+        channels=in_channels
+
+
+        for i in range(num_layers):
+
+            layer=MetaDenseLayer(
+                channels,
+                growth_rate
+            )
+
+            layers.append(layer)
+
+            channels += growth_rate
+
+
+
+        self.block=nn.Sequential(
+            *layers
+        )
+
+
+        self.out_channels=channels
+
+
+
+    def forward(self,x):
+
+        return self.block(x)
+
+class MetaTransition(MetaModule):
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels
+    ):
+
+        super().__init__()
+
+
+        self.bn=MetaBatchNorm2d(
+            in_channels
+        )
+
+
+        self.conv=MetaConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False
+        )
+
+
+    def forward(self,x):
+
+        x=F.relu(
+            self.bn(x)
+        )
+
+
+        x=self.conv(x)
+
+
+        x=F.avg_pool2d(
+            x,
+            2
+        )
+
+        return x
+
+class MetaDenseNetLite(MetaModule):
+
+
+    """
+    CIFAR10/CINIC10 DenseNet backbone
+
+    DenseBlock1
+    DenseBlock2
+    DenseBlock3
+
+    feature_dim=256
+
+    MetaMoEHead
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            MetaDenseNetLite,
+            self
+        ).__init__()
+
+
+
+        growth_rate=16
+
+
+
+        self.conv1 = MetaConv2d(
+            3,
+            32,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+        self.bn1 = MetaBatchNorm2d(
+            32
+        )
+
+
+
+        # Dense Block 1
+
+        self.block1 = MetaDenseBlock(
+            num_layers=3,
+            in_channels=32,
+            growth_rate=growth_rate
+        )
+
+
+        channels1 = (
+            32 + 3*growth_rate
+        )
+
+
+        self.trans1 = MetaTransition(
+            channels1,
+            64
+        )
+
+
+
+        # Dense Block 2
+
+        self.block2 = MetaDenseBlock(
+            num_layers=4,
+            in_channels=64,
+            growth_rate=growth_rate
+        )
+
+
+        channels2 = (
+            64 + 4*growth_rate
+        )
+
+
+        self.trans2 = MetaTransition(
+            channels2,
+            128
+        )
+
+
+
+        # Dense Block 3
+
+        self.block3 = MetaDenseBlock(
+            num_layers=4,
+            in_channels=128,
+            growth_rate=growth_rate
+        )
+
+
+        channels3 = (
+            128 + 4*growth_rate
+        )
+
+
+        # feature projection
+
+        self.feature_expand = MetaConv2d(
+            channels3,
+            256,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False
+        )
+
+
+        self.bn_last = MetaBatchNorm2d(
+            256
+        )
+
+
+        self.feature_dim=256
+
+
+
+        self.fc = MetaMoEHead(
+            input_dim=256,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def forward(self,x):
+
+
+        x=self.conv1(x)
+
+        x=self.bn1(x)
+
+        x=F.relu(x)
+
+
+
+        x=self.block1(x)
+
+        x=self.trans1(x)
+
+
+
+        x=self.block2(x)
+
+        x=self.trans2(x)
+
+
+
+        x=self.block3(x)
+
+
+
+        x=self.feature_expand(x)
+
+        x=self.bn_last(x)
+
+        x=F.relu(x)
+
+
+
+        x=F.adaptive_avg_pool2d(
+            x,
+            1
+        )
+
+
+        x=torch.flatten(
+            x,
+            1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x
+class MetaDepthwiseConv2d(MetaModule):
+
+    def __init__(
+        self,
+        channels,
+        kernel_size=3,
+        stride=1,
+        padding=1
+    ):
+        super().__init__()
+
+        conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size,
+            stride,
+            padding,
+            groups=channels,
+            bias=False
+        )
+
+
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.groups = channels
+        self.dilation = conv.dilation
+
+
+        self.register_buffer(
+            "weight",
+            to_var(
+                conv.weight.data,
+                requires_grad=True
+            )
+        )
+
+
+    def forward(self,x):
+
+        return F.conv2d(
+            x,
+            self.weight,
+            None,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups
+        )
+
+
+    def named_leaves(self):
+
+        return [
+            (
+                "weight",
+                self.weight
+            )
+        ]
+class SmallMetaMBConv(MetaModule):
+
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        expand_ratio=2,
+        stride=1
+    ):
+
+        super().__init__()
+
+
+        hidden_dim = (
+            in_planes * expand_ratio
+        )
+
+
+        self.use_res = (
+            stride == 1
+            and in_planes == out_planes
+        )
+
+
+        self.conv = nn.Sequential(
+
+            # expand
+
+            MetaConv2d(
+                in_planes,
+                hidden_dim,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                hidden_dim
+            ),
+
+            nn.ReLU6(inplace=True),
+
+
+
+            # depthwise
+
+            MetaDepthwiseConv2d(
+                hidden_dim,
+                kernel_size=3,
+                stride=stride,
+                padding=1
+            ),
+
+            MetaBatchNorm2d(
+                hidden_dim
+            ),
+
+            nn.ReLU6(inplace=True),
+
+
+
+            # projection
+
+            MetaConv2d(
+                hidden_dim,
+                out_planes,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                out_planes
+            )
+
+        )
+
+
+    def forward(self,x):
+
+        out=self.conv(x)
+
+
+        if self.use_res:
+
+            out=out+x
+
+
+        return out
+class SmallMetaMobileNetV2(MetaModule):
+
+    """
+    Small CNN replacement
+
+    Structure:
+
+    Conv16
+
+    MBConv
+    16 -> 32
+
+    MBConv
+    32 -> 64
+
+    GAP
+
+    MetaMoEHead
+
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            SmallMetaMobileNetV2,
+            self
+        ).__init__()
+
+
+
+        # stem
+
+        self.conv1 = nn.Sequential(
+
+            MetaConv2d(
+                3,
+                16,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                16
+            ),
+
+            nn.ReLU6(inplace=True)
+
+        )
+
+
+
+        # 对应原 conv2
+
+        self.block1 = SmallMetaMBConv(
+
+            16,
+            32,
+
+            expand_ratio=2,
+
+            stride=2
+
+        )
+
+
+
+        # 对应原 conv3
+
+        self.block2 = SmallMetaMBConv(
+
+            32,
+            64,
+
+            expand_ratio=2,
+
+            stride=2
+
+        )
+
+
+
+        self.feature_dim = 64
+
+
+
+        self.fc = MetaMoEHead(
+
+            input_dim=self.feature_dim,
+
+            num_classes=num_classes,
+
+            num_experts=num_experts,
+
+            expert_hidden_dim=expert_hidden_dim
+
+        )
+
+
+
+    def forward(self,x):
+
+
+        x=self.conv1(x)
+
+
+        x=self.block1(x)
+
+
+        x=self.block2(x)
+
+
+
+        # CIFAR feature
+
+        x=F.adaptive_avg_pool2d(
+            x,
+            1
+        )
+
+
+        x=torch.flatten(
+            x,
+            1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x
+class SmallMetaDenseLayer(MetaModule):
+
+    """
+    Lightweight Dense layer
+
+    BN-ReLU-Conv3x3
+    concat feature
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        growth_rate=16
+    ):
+
+        super(
+            SmallMetaDenseLayer,
+            self
+        ).__init__()
+
+
+        self.bn = MetaBatchNorm2d(
+            in_channels
+        )
+
+
+        self.conv = MetaConv2d(
+            in_channels,
+            growth_rate,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+
+    def forward(self,x):
+
+        out = F.relu(
+            self.bn(x)
+        )
+
+
+        out = self.conv(out)
+
+
+        # Dense connection
+
+        out = torch.cat(
+            [
+                x,
+                out
+            ],
+            dim=1
+        )
+
+
+        return out
+class SmallMetaDenseBlock(MetaModule):
+
+
+    def __init__(
+        self,
+        in_channels,
+        growth_rate=16,
+        layers=1
+    ):
+
+        super(
+            SmallMetaDenseBlock,
+            self
+        ).__init__()
+
+
+        modules=[]
+
+
+        channels=in_channels
+
+
+        for i in range(layers):
+
+            modules.append(
+                SmallMetaDenseLayer(
+                    channels,
+                    growth_rate
+                )
+            )
+
+            channels += growth_rate
+
+
+
+        self.block=nn.Sequential(
+            *modules
+        )
+
+
+        self.out_channels=channels
+
+
+
+    def forward(self,x):
+
+        return self.block(x)
+class SmallMetaDenseNet(MetaModule):
+
+
+    """
+    Small Dense CNN for Federated Learning
+
+
+    Structure:
+
+    Conv16
+
+    DenseBlock
+    16 -> 32
+
+
+    DenseBlock
+    32 -> 48
+
+
+    DenseBlock
+    48 -> 64
+
+
+    Flatten
+
+    1024 feature
+
+    MetaMoEHead
+
+
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            SmallMetaDenseNet,
+            self
+        ).__init__()
+
+
+
+        # stem
+
+        self.conv1 = MetaConv2d(
+            3,
+            16,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+
+        self.bn1 = MetaBatchNorm2d(
+            16
+        )
+
+
+
+        # block1
+
+        self.block1 = SmallMetaDenseBlock(
+            16,
+            growth_rate=16
+        )
+
+
+        # 输出:
+        # 16+16=32
+
+
+
+        self.block2 = SmallMetaDenseBlock(
+            32,
+            growth_rate=16
+        )
+
+
+        # 输出:
+        # 48
+
+
+
+        self.block3 = SmallMetaDenseBlock(
+            48,
+            growth_rate=16
+        )
+
+
+        # 输出:
+        # 64
+
+
+
+        self.pool = nn.MaxPool2d(
+            2
+        )
+
+
+
+        self.feature_dim = 64*4*4
+
+
+
+        self.fc = MetaMoEHead(
+
+            input_dim=self.feature_dim,
+
+            num_classes=num_classes,
+
+            num_experts=num_experts,
+
+            expert_hidden_dim=expert_hidden_dim
+
+        )
+
+
+
+    def forward(self,x):
+
+
+        x = F.relu(
+            self.bn1(
+                self.conv1(x)
+            )
+        )
+
+
+        # 32×32
+
+        x=self.block1(x)
+
+        x=self.pool(x)
+
+
+        # 16×16
+
+        x=self.block2(x)
+
+        x=self.pool(x)
+
+
+        # 8×8
+
+        x=self.block3(x)
+
+        x=self.pool(x)
+
+
+        # 4×4
+
+        x=x.view(
+            x.size(0),
+            -1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x
+class MetaSEBlock(MetaModule):
+
+    def __init__(
+        self,
+        channels,
+        reduction=4
+    ):
+        super().__init__()
+
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+
+        self.fc1 = MetaConv2d(
+            channels,
+            channels // reduction,
+            kernel_size=1
+        )
+
+
+        self.fc2 = MetaConv2d(
+            channels // reduction,
+            channels,
+            kernel_size=1
+        )
+
+
+    def forward(self,x):
+
+        w = self.pool(x)
+
+
+        w = F.relu(
+            self.fc1(w)
+        )
+
+
+        w = torch.sigmoid(
+            self.fc2(w)
+        )
+
+
+        return x*w
+class SmallMetaEfficientBlock(MetaModule):
+
+    """
+    EfficientNet-lite MBConv
+
+    Expand
+    Depthwise
+    SE
+    Project
+    """
+
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        expand_ratio=2,
+        stride=1
+    ):
+
+        super().__init__()
+
+
+        hidden_dim = (
+            in_planes * expand_ratio
+        )
+
+
+        self.use_res = (
+            stride==1
+            and in_planes==out_planes
+        )
+
+
+        self.expand = nn.Sequential(
+
+            MetaConv2d(
+                in_planes,
+                hidden_dim,
+                kernel_size=1,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                hidden_dim
+            ),
+
+            nn.SiLU(inplace=True)
+
+        )
+
+
+        self.depthwise = nn.Sequential(
+
+            MetaDepthwiseConv2d(
+                hidden_dim,
+                kernel_size=3,
+                stride=stride,
+                padding=1
+            ),
+
+            MetaBatchNorm2d(
+                hidden_dim
+            ),
+
+            nn.SiLU(inplace=True)
+
+        )
+
+
+        self.se = MetaSEBlock(
+            hidden_dim
+        )
+
+
+        self.project = nn.Sequential(
+
+            MetaConv2d(
+                hidden_dim,
+                out_planes,
+                kernel_size=1,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                out_planes
+            )
+
+        )
+
+
+
+    def forward(self,x):
+
+        identity=x
+
+
+        out=self.expand(x)
+
+        out=self.depthwise(out)
+
+
+        out=self.se(out)
+
+
+        out=self.project(out)
+
+
+        if self.use_res:
+
+            out=out+identity
+
+
+        return out
+class SmallMetaEfficientNet(MetaModule):
+
+    """
+    CIFAR EfficientNet Lite
+
+
+    Conv16
+
+    EfficientBlock
+    16 -> 32
+
+
+    EfficientBlock
+    32 -> 64
+
+
+    Flatten
+
+    1024 feature
+
+    MetaMoEHead
+
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            SmallMetaEfficientNet,
+            self
+        ).__init__()
+
+
+
+        self.conv1 = nn.Sequential(
+
+            MetaConv2d(
+                3,
+                16,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ),
+
+            MetaBatchNorm2d(
+                16
+            ),
+
+            nn.SiLU(inplace=True)
+
+        )
+
+
+
+        self.block1 = SmallMetaEfficientBlock(
+
+            16,
+            32,
+
+            expand_ratio=2,
+
+            stride=2
+
+        )
+
+
+
+        self.block2 = SmallMetaEfficientBlock(
+
+            32,
+            64,
+
+            expand_ratio=2,
+
+            stride=2
+
+        )
+
+
+        self.pool = nn.MaxPool2d(
+            2
+        )
+
+
+        self.feature_dim = (
+            64*4*4
+        )
+
+
+
+        self.fc = MetaMoEHead(
+
+            input_dim=self.feature_dim,
+
+            num_classes=num_classes,
+
+            num_experts=num_experts,
+
+            expert_hidden_dim=expert_hidden_dim
+
+        )
+
+
+
+    def forward(self,x):
+
+
+        x=self.conv1(x)
+
+
+
+        # 32×32
+
+        x=self.block1(x)
+
+
+        # 16×16
+
+        x=self.block2(x)
+
+
+        # 8×8
+
+        x=self.pool(x)
+
+
+        # 4×4
+
+
+        x=x.view(
+            x.size(0),
+            -1
+        )
+
+
+        x=self.fc(x)
+
+
+        return x
+class SmallMetaVGGBlock(MetaModule):
+
+    """
+    VGG style block
+
+    Conv3x3
+    BN
+    ReLU
+
+    Conv3x3
+    BN
+    ReLU
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels
+    ):
+
+        super(
+            SmallMetaVGGBlock,
+            self
+        ).__init__()
+
+
+        self.conv1 = MetaConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+        self.bn1 = MetaBatchNorm2d(
+            out_channels
+        )
+
+
+        self.conv2 = MetaConv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False
+        )
+
+        self.bn2 = MetaBatchNorm2d(
+            out_channels
+        )
+
+
+
+    def forward(self,x):
+
+        x = F.relu(
+            self.bn1(
+                self.conv1(x)
+            )
+        )
+
+
+        x = F.relu(
+            self.bn2(
+                self.conv2(x)
+            )
+        )
+
+
+        return x
+class SmallMetaVGG(MetaModule):
+
+    """
+    Lightweight VGG backbone
+
+
+    Stage1:
+        3 -> 16 -> 16
+
+
+    Stage2:
+        16 -> 32 -> 32
+
+
+    Stage3:
+        32 -> 64 -> 64
+
+
+    Feature:
+        1024
+
+
+    Head:
+        MetaMoEHead
+
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+
+        super(
+            SmallMetaVGG,
+            self
+        ).__init__()
+
+
+
+        self.stage1 = SmallMetaVGGBlock(
+            3,
+            16
+        )
+
+
+        self.stage2 = SmallMetaVGGBlock(
+            16,
+            32
+        )
+
+
+        self.stage3 = SmallMetaVGGBlock(
+            32,
+            64
+        )
+
+
+        self.pool = nn.MaxPool2d(
+            kernel_size=2
+        )
+
+
+
+        # 保持和 SmallMetaConvNet 一致
+
+        self.feature_dim = (
+            64*4*4
+        )
+
+
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def forward(self,x):
+
+
+        # 32×32
+
+        x = self.stage1(x)
+
+        x = self.pool(x)
+
+
+
+        # 16×16
+
+        x = self.stage2(x)
+
+        x = self.pool(x)
+
+
+
+        # 8×8
+
+        x = self.stage3(x)
+
+        x = self.pool(x)
+
+
+
+        # 4×4
+
+        x = x.view(
+            x.size(0),
+            -1
+        )
+
+
+        x = self.fc(x)
+
+
+        return x
+class SmallMetaConvNet64(MetaModule):
+    """
+    Tiny-ImageNet 64x64 version
+
+    Structure:
+        Conv16
+        Conv32
+        Conv64
+
+        3 times downsample
+
+        Adaptive pooling
+
+        MetaMoEHead
+
+    Input:
+        3 x 64 x 64
+
+    Feature:
+        1024
+    """
+
+    def __init__(
+        self,
+        num_classes=200,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+        super(
+            SmallMetaConvNet64,
+            self
+        ).__init__()
+
+
+        self.conv1 = MetaConv2d(
+            3,
+            16,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn1 = MetaBatchNorm2d(16)
+
+
+
+        self.conv2 = MetaConv2d(
+            16,
+            32,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn2 = MetaBatchNorm2d(32)
+
+
+
+        self.conv3 = MetaConv2d(
+            32,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn3 = MetaBatchNorm2d(64)
+
+
+
+        # 关键：
+        # 无论输入64×64，
+        # 最终固定成4×4
+        self.pool = nn.AdaptiveAvgPool2d(
+            (4,4)
+        )
+
+
+        self.feature_dim = (
+            64 * 4 * 4
+        )
+
+
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def forward(self,x):
+
+        x = F.relu(
+            self.bn1(
+                self.conv1(x)
+            )
+        )
+
+        x = F.max_pool2d(
+            x,
+            2
+        )
+
+
+        x = F.relu(
+            self.bn2(
+                self.conv2(x)
+            )
+        )
+
+        x = F.max_pool2d(
+            x,
+            2
+        )
+
+
+        x = F.relu(
+            self.bn3(
+                self.conv3(x)
+            )
+        )
+
+        x = F.max_pool2d(
+            x,
+            2
+        )
+
+
+        # 64输入:
+        # 64 -> 32 -> 16 -> 8
+        #
+        # Adaptive:
+        # 8×8 -> 4×4
+
+        x = self.pool(x)
+
+
+        x = torch.flatten(
+            x,
+            1
+        )
+
+
+        x = self.fc(x)
+
+
+        return x
+class SmallMetaConvNet96(MetaModule):
+    """
+    STL-10 96x96 version
+
+    Input:
+        3 x 96 x 96
+
+    Structure:
+        Conv32
+        Conv64
+        Conv128
+        AdaptivePool
+        MetaMoEHead
+
+    Feature:
+        2048
+    """
+
+    def __init__(
+        self,
+        num_classes=10,
+        num_experts=4,
+        expert_hidden_dim=128
+    ):
+        super(
+            SmallMetaConvNet96,
+            self
+        ).__init__()
+
+
+        self.conv1 = MetaConv2d(
+            3,
+            32,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn1 = MetaBatchNorm2d(32)
+
+
+
+        self.conv2 = MetaConv2d(
+            32,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn2 = MetaBatchNorm2d(64)
+
+
+
+        self.conv3 = MetaConv2d(
+            64,
+            128,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        self.bn3 = MetaBatchNorm2d(128)
+
+
+
+        self.pool = nn.MaxPool2d(
+            kernel_size=2,
+            stride=2
+        )
+
+
+        # 12×12 -> 4×4
+        self.avgpool = nn.AdaptiveAvgPool2d(
+            (4,4)
+        )
+
+
+        self.feature_dim = 128 * 4 * 4
+
+
+        self.fc = MetaMoEHead(
+            input_dim=self.feature_dim,
+            num_classes=num_classes,
+            num_experts=num_experts,
+            expert_hidden_dim=expert_hidden_dim
+        )
+
+
+
+    def forward(self, x):
+
+        x = F.relu(
+            self.bn1(
+                self.conv1(x)
+            )
+        )
+
+        x = self.pool(x)
+
+
+        x = F.relu(
+            self.bn2(
+                self.conv2(x)
+            )
+        )
+
+        x = self.pool(x)
+
+
+        x = F.relu(
+            self.bn3(
+                self.conv3(x)
+            )
+        )
+
+        x = self.pool(x)
+
+
+        x = self.avgpool(x)
+
+
+        x = torch.flatten(
+            x,
+            1
+        )
+
+
+        x = self.fc(x)
+
+
+        return x

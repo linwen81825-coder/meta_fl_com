@@ -2,7 +2,15 @@ import torch
 import torch.nn as nn
 from dataset.dataSplit_LN_new import get_data_loaders_new
 from model.model import MLP
-from model.wideresnet import SmallMetaConvNet, WideResNet, SmallMetaConvNet1 ,ResNet18,ResNet10Lite
+from model.wideresnet import (
+    SmallMetaConvNet,
+    WideResNet,
+    SmallMetaConvNet1,
+    ResNet18,
+    ResNet10Lite,
+    SmallMetaConvNet64,
+    SmallMetaConvNet96
+)
 import datetime
 from dataset.dataSplit_clothing1m import get_data_loaders_clothing1m
 import argparse
@@ -100,13 +108,18 @@ class RoundOnlyConsoleLogger:
 
 
 def build_model(dataset):
-    if dataset in ['cifar10','cinic10']:
+    if dataset in ['cifar10','cinic10','fashionmnist','svhn']:
         model = SmallMetaConvNet(num_classes=10)
-        # model = ResNet10Lite(num_classes=10,num_experts=4,expert_hidden_dim=128)
     elif dataset == 'cifar100':
         model = SmallMetaConvNet(num_classes=100)
+    elif dataset == 'tinyimagenet':
+        model = SmallMetaConvNet64(num_classes=200)
     elif dataset == 'clothing1m':
         model = SmallMetaConvNet1(num_classes=14)
+    elif dataset == 'stl10':
+        model = SmallMetaConvNet96(num_classes=10)
+    else:
+        raise ValueError(f'Unsupported dataset: {dataset}')
 
     if torch.cuda.is_available():
         model.cuda()
@@ -350,7 +363,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--dataset',
     type=str,
-    default='cinic10',
+    default='svhn',
     help='The name of the dataset.'
 )
 
