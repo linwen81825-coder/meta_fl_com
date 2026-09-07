@@ -505,6 +505,19 @@ def introduce_label_noise(dataset, indices, noise_rate):
 
     dataset.targets = targets.tolist()
 
+    # SVHN / STL10 实际通过 labels 读取标签，同步写回噪声标签。
+    if hasattr(dataset, 'labels'):
+        dataset.labels = targets.copy()
+
+    # ImageFolder（如 CINIC-10）实际通过 samples 读取标签。
+    if hasattr(dataset, 'samples'):
+        dataset.samples = [
+            (sample[0], int(targets[idx]))
+            for idx, sample in enumerate(dataset.samples)
+        ]
+        if hasattr(dataset, 'imgs'):
+            dataset.imgs = dataset.samples
+
  
 def count_class_samples(dataset): 
     """统计每个类别的样本数量""" 
